@@ -18,6 +18,7 @@
 #include <sensor/wb_map12e_active_power.h>
 #include <sensor/wb_map12e_frequency.h>
 #include <sensor/wb_map12e_energy.h>
+#include <sensor/wb_map12e_reactive_power.h>
 
 #include <string>
 
@@ -42,6 +43,7 @@ EDCommon::Sensor::Sensor* supplierEnergy = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyVoltage = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyCurrent = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyPower = nullptr;
+EDCommon::Sensor::Sensor* supplierEnergyReactivePower = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyFrequency = nullptr;
 
 PCF8574 relayExp(RELAY_IIC_ADDRESS);
@@ -242,6 +244,14 @@ void setup()
         LOGE("setup", "failed to init supplier energy power sensor");
     }
 
+    supplierEnergyReactivePower = new Faraday::WBMAP12EReactivePower(map12e, 1, EDWB::MAP12E_PHASE_L1);
+    if (!supplierEnergyReactivePower->init(0, 10000, {
+            EDCommon::Sensor::withMQTT(&mqtt, mqttPrefix, "faraday", "Supplier energy reactive power"),
+            EDCommon::Sensor::withDiscovery(&discoveryMgr, device),
+        })) {
+        LOGE("setup", "failed to init supplier energy reactive power sensor");
+    }
+
     supplierEnergyFrequency = new EDCommon::Sensor::WBMAP12EFrequency(map12e);
     if (!supplierEnergyFrequency->init(2, 10000, {
             EDCommon::Sensor::withMQTT(&mqtt, mqttPrefix, "faraday", "Supplier energy frequency"),
@@ -279,6 +289,7 @@ void loop()
         if (supplierEnergyVoltage) supplierEnergyVoltage->update();
         if (supplierEnergyCurrent) supplierEnergyCurrent->update();
         if (supplierEnergyPower) supplierEnergyPower->update();
+        if (supplierEnergyReactivePower) supplierEnergyReactivePower->update();
         if (supplierEnergyFrequency) supplierEnergyFrequency->update();
         xSemaphoreGive(modbusBus);
     }

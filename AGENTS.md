@@ -13,11 +13,11 @@ device, serves a Preact panel from LittleFS, exposes healthchecks and OTA, probe
 expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, and emits one boot beep.
 
 One domain now exists: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
-voltage, current, active power, frequency and a software-offset supplier energy counter, plus
-CT-ratio and supplier-sync settings. There is still **no domain logic** for relays/inputs, GSM,
-RF433, LED strips, analog inputs, RS-485 devices other than the WB-MAP12E, or the buzzer beyond
-the boot beep. Those pins and objects are reserved for the next waves; do not describe them as
-working features. Target hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
+voltage, current, active power, reactive power, frequency and a software-offset supplier
+energy counter, plus CT-ratio and supplier-sync settings. There is still **no domain logic** for
+relays/inputs, GSM, RF433, LED strips, analog inputs, RS-485 devices other than the WB-MAP12E,
+or the buzzer beyond the boot beep. Those pins and objects are reserved for the next waves; do
+not describe them as working features. Target hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
 `src/defines.h` declares model `ESP32-LAN8720`, with board revision **TBD**. PlatformIO board
 profile is `esp32dev`.
 
@@ -108,8 +108,9 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
 - Single-threaded cooperative Arduino loop. Globals are constructed at file scope in
   `src/main.cpp`: `configMgr` (`EDConfig::DataMgr<Config>` + `StorageLittleFS("/config.bin")`),
   `networkMgr`, `networkApi`, `mqtt`, `modbus` (`EDWB::WirenBoard` on `Serial2`), `healthCheck`,
-  `discoveryMgr`, `map12e` (`EDWB::MAP12E*`), five `EDCommon::Sensor::Sensor*` supplier
-  pointers (`supplierEnergy`, `…Voltage`, `…Current`, `…Power`, `…Frequency`), two `PCF8574`
+  `discoveryMgr`, `map12e` (`EDWB::MAP12E*`), six `EDCommon::Sensor::Sensor*` supplier
+  pointers (`supplierEnergy`, `…Voltage`, `…Current`, `…Power`, `…ReactivePower`,
+  `…Frequency`), two `PCF8574`
   objects (`0x24` relay, `0x22` input) and `Handler`.
 - `setup()` order: random seed → `modbusBus` FreeRTOS binary semaphore (create + give, so the
   bus guard boots unlocked) → `Serial` (115200) → verbose esp_log → LittleFS mount
@@ -120,20 +121,21 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   connect/disconnect) → healthcheck registers `mqtt` → network settings callback →
   `handler.init()` → HA discovery init + one `addDevice()` → `modbus.addMAP12E(config
   address)` + `handler.setMap12E()` → CT-ratio reconciliation (read the device ratio, write
-  the stored one back only if it differs; `LOGW` when the meter is unreachable) → five sensor
+  the stored one back only if it differs; `LOGW` when the meter is unreachable) → six sensor
   objects (`WBMAP12EEnergy` ch 1/L1, precision 2, 60 s, with the `energySyncValue`/
   `energyMeterBase` pointers; `WBMAP12EVoltage` prec 1, 10 s; `WBMAP12ECurrent` prec 2, 10 s;
-  `WBMAP12EActivePower` prec 0, 10 s; `WBMAP12EFrequency` prec 2, 10 s), each with MQTT +
+  `WBMAP12EActivePower` prec 0, 10 s; local `Faraday::WBMAP12EReactivePower` prec 0, 10 s;
+  `WBMAP12EFrequency` prec 2, 10 s), each with MQTT +
   discovery options → `inited = true` → one 2700 Hz / 150 ms boot beep.
 - `loop()` order: `RebootAfterResponse::update()` first, then `networkMgr.loop()`,
   `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`, `modbus.loop()`,
-  the five null-guarded sensor `update()` calls, the electricity-status evaluation/publish
+  the six null-guarded sensor `update()` calls, the electricity-status evaluation/publish
   (outside the `modbusBus` block — `getValue()` is not bus access), then
   `networkLogger.update()`. When `inited`
   is false only the deferred-reboot check runs. Modbus bus access is serialized between the
   loop task and the web handlers (AsyncTCP task) by a FreeRTOS binary semaphore
   `modbusBus` (created and initially given as one of the first `setup()` actions): `loop()`
-  wraps `modbus.loop()` + the five `update()` calls in a `xSemaphoreTake(modbusBus, 200 ms)` /
+  wraps `modbus.loop()` + the six `update()` calls in a `xSemaphoreTake(modbusBus, 200 ms)` /
   `xSemaphoreGive` pair and skips the whole bus-touching block on contention (sensors retry
   at their next interval), and the meter/modbus handlers in `src/web/handler.cpp` take the
   same semaphore through the RAII `ModbusGuard` (also 200 ms bounded).
@@ -149,12 +151,13 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
     `EDMQTT::Consumer` for topic subscriptions. Faraday currently has no consumers.
   - `ed-utils` — `EDUtils::LogConfig`/`NetworkLogger`, `formatString`, `getMacAddress`,
     `getChipID`, `buildJson`, `LOGx` macros.
-  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and the five WB-MAP12E
+  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and the six WB-MAP12E
     sensors register entities on it (unit/device class/state class).
   - `ed-healthcheck` — `Ready` interface + `HealthCheck`; only `mqtt` is registered.
   - `ed-wb` — `EDWB::WirenBoard` (Modbus RTU client over `Stream`) + device drivers; Faraday
-    uses `MAP12E` (`getVoltage`/`getCurrent`/`getActivePower`/`getFrequency`/
-    `getForwardActiveEnergy`, `getCTTransformRatio`/`setCTTransformRatio`), channel 1 / L1.
+    uses `MAP12E` (`getVoltage`/`getCurrent`/`getActivePower`/`getReactivePower`/
+    `getFrequency`/`getForwardActiveEnergy`, `getCTTransformRatio`/`setCTTransformRatio`),
+    channel 1 / L1.
   - `ed-common` — `EDCommon::Sensor::Sensor` base (precision, update interval, MQTT publish,
     HA discovery incl. `state_class`) and header-only `WBMAP12E*` subclasses. The energy
     sensor emulates a resettable counter with `energySyncValue` + (device − `energyMeterBase`).
@@ -188,11 +191,11 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
 - MQTT/HA: `mqtt.init()` no-ops with an empty host. On network connect the logger is enabled
   and MQTT is connected; on disconnect MQTT is disconnected. `DiscoveryMgr::loop()` sends
   discovery after ~10 s and retries until the send function succeeds (unless disabled). The
-  five sensor objects publish retained plain values on
+  six sensor objects publish retained plain values on
   `faraday/<chip>/supplier_energy*/state` (`supplier_energy`, `…_voltage`, `…_current`,
-  `…_power`, `…_frequency`) and register discovery entities on the single device:
-  `measurement` state class for voltage/current/power/frequency and `total_increasing` for
-  the supplier energy counter.
+  `…_power`, `…_reactive_power`, `…_frequency`) and register discovery entities on the single
+  device: `measurement` state class for voltage/current/power/reactive power/frequency and
+  `total_increasing` for the supplier energy counter.
 - Electricity status: an `ElectricityStatus` enum (`OK`, `ON_BATTERY`; `ON_GENERATOR`/`FAIL`
   reserved for future generator/inverter logic and never entered) is derived from the L1
   voltage sensor with hysteresis — `OK` → `ON_BATTERY` at ≤0 V, `ON_BATTERY` → `OK` at >100 V,
