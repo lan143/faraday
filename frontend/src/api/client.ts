@@ -1,4 +1,5 @@
 import type {
+  ControlsState,
   DeviceStatus,
   EmptyObject,
   HealthResponse,
@@ -392,4 +393,42 @@ export function saveMeterSettings(
     body,
     EMPTY_BODY_MESSAGE,
   );
+}
+
+/** GET /api/controls — ventilation and light relay state. */
+export function getControls(): Promise<ApiResult<ControlsState>> {
+  return getJson<ControlsState>('/api/controls', EMPTY_BODY_MESSAGE);
+}
+
+/**
+ * POST /api/controls — sends only the provided fields and returns the
+ * refreshed state. The touched field always echoes the requested boolean; the
+ * untouched field is a live readback or `null` when the relay bus is busy.
+ * Invalid input throws client-side instead of being sent.
+ */
+export function saveControls(payload: {
+  ventilation?: boolean;
+  light?: boolean;
+}): Promise<ApiResult<ControlsState>> {
+  const body: { ventilation?: boolean; light?: boolean } = {};
+
+  if (payload.ventilation !== undefined) {
+    if (typeof payload.ventilation !== 'boolean') {
+      throw new Error('Ventilation must be true or false.');
+    }
+    body.ventilation = payload.ventilation;
+  }
+
+  if (payload.light !== undefined) {
+    if (typeof payload.light !== 'boolean') {
+      throw new Error('Light must be true or false.');
+    }
+    body.light = payload.light;
+  }
+
+  if (body.ventilation === undefined && body.light === undefined) {
+    throw new Error('ventilation or light required.');
+  }
+
+  return postJson<ControlsState>('/api/controls', body, EMPTY_BODY_MESSAGE);
 }

@@ -19,6 +19,8 @@
 #include <sensor/wb_map12e_frequency.h>
 #include <sensor/wb_map12e_energy.h>
 #include <sensor/wb_map12e_reactive_power.h>
+#include <relay/pcf8574.h>
+#include <light/relay_light.h>
 
 #include <string>
 
@@ -49,11 +51,24 @@ EDCommon::Sensor::Sensor* supplierEnergyFrequency = nullptr;
 PCF8574 relayExp(RELAY_IIC_ADDRESS);
 PCF8574 inputExp(INPUT_IIC_ADDRESS);
 
+// Set from the relay-expander probe in setup(): PCF8574::read8() returns 0 on
+// I2C failure, so isEnabled() would falsely report both relays ON when absent.
+bool relayExpPresent = false;
+
+EDCommon::Relay::PCF8574P ventilationRelay(&relayExp);
+EDCommon::Relay::PCF8574P lightRelay(&relayExp);
+EDCommon::Light::Relay light(&lightRelay);
+
 // Binary semaphore serializing Modbus bus access between the loop task and the
 // AsyncTCP/webserver task (extern-declared in src/web/handler.cpp as the RAII
 // ModbusGuard). Created and given as one of the first setup() actions, before
 // any bus call; starts in the unlocked state.
 SemaphoreHandle_t modbusBus = nullptr;
+
+// Same pattern for the shared relay PCF8574 (its write() is a read-modify-write
+// of _dataOut and read() mutates _dataIn, so concurrent task access can corrupt
+// an I2C transaction). Extern-declared in src/web/handler.cpp as ControlGuard.
+SemaphoreHandle_t controlBus = nullptr;
 
 Handler handler(&configMgr, &networkApi, &healthCheck, &modbus);
 
@@ -96,6 +111,11 @@ void setup()
     modbusBus = xSemaphoreCreateBinary();
     xSemaphoreGive(modbusBus);
 
+    // Same guard for the relay expander, created/given before the relay inits
+    // below and before handler.init(); boots unlocked like modbusBus.
+    controlBus = xSemaphoreCreateBinary();
+    xSemaphoreGive(controlBus);
+
     Serial.begin(SERIAL_SPEED);
 
     esp_log_level_set("*", ESP_LOG_VERBOSE);
@@ -135,7 +155,8 @@ void setup()
     Wire.setClock(100000);
 
     LOGI("setup", "init PCF8574");
-    if (relayExp.begin()) {
+    relayExpPresent = relayExp.begin();
+    if (relayExpPresent) {
         LOGI("setup", "relay expander found at 0x%02X", RELAY_IIC_ADDRESS);
     } else {
         LOGW("setup", "relay expander not found at 0x%02X", RELAY_IIC_ADDRESS);
@@ -260,6 +281,43 @@ void setup()
         LOGE("setup", "failed to init supplier energy frequency sensor");
     }
 
+    if (relayExpPresent) {
+        // The three relay/light inits touch the shared PCF8574 and must never be
+        // skipped: block (bounded in practice by the 200 ms handler guard) until
+        // the bus is free.
+        const bool controlBusLocked = controlBus != nullptr
+            && xSemaphoreTake(controlBus, portMAX_DELAY) == pdTRUE;
+
+        if (!ventilationRelay.init(VENTILATION_RELAY_CHANNEL, {
+                EDCommon::Relay::withMQTT(&mqtt, mqttPrefix, "faraday", "Ventilation"),
+                EDCommon::Relay::withDiscovery(&discoveryMgr, device),
+            })) {
+            LOGE("setup", "failed to init ventilation relay");
+        }
+
+        // Backing relay for the light: no MQTT/discovery options so no duplicate HA
+        // switch appears next to the light entity (the light owns the topics).
+        if (!lightRelay.init(LIGHT_RELAY_CHANNEL, {})) {
+            LOGE("setup", "failed to init light relay");
+        }
+
+        // Must come after lightRelay.init(): light.init() re-reads the relay state.
+        if (!light.init({
+                EDCommon::Light::withMQTT(&mqtt, mqttPrefix, "faraday", "Light"),
+                EDCommon::Light::withDiscovery(&discoveryMgr, device),
+            })) {
+            LOGE("setup", "failed to init light");
+        }
+
+        if (controlBusLocked) {
+            xSemaphoreGive(controlBus);
+        }
+
+        handler.setControls(&ventilationRelay, &light);
+    } else {
+        LOGW("setup", "relay expander absent - ventilation/light disabled");
+    }
+
     inited = true;
     LOGI("setup", "complete");
 
@@ -292,6 +350,16 @@ void loop()
         if (supplierEnergyReactivePower) supplierEnergyReactivePower->update();
         if (supplierEnergyFrequency) supplierEnergyFrequency->update();
         xSemaphoreGive(modbusBus);
+    }
+
+    // I2C/MQTT work, not Modbus: drain the relay/light command queues outside
+    // the bus guard. Light::Relay::update() also pumps the backing lightRelay.
+    // The PCF8574 is shared with the web handlers, so hold controlBus across
+    // both updates; on contention skip the block this cycle (retry next).
+    if (relayExpPresent && controlBus != nullptr && xSemaphoreTake(controlBus, pdMS_TO_TICKS(200)) == pdTRUE) {
+        ventilationRelay.update();
+        light.update();
+        xSemaphoreGive(controlBus);
     }
 
     // Cheap, no bus access: derive the electricity state from the last valid

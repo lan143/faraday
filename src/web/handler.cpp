@@ -5,6 +5,8 @@
 #include <ExtStrings.h>
 #include <Json.h>
 #include <log/log.h>
+#include <relay/relay.h>
+#include <light/light.h>
 #include <wirenboard.h>
 #include <cstring>
 #include <string.h>
@@ -16,6 +18,9 @@
 // between the loop task and this (AsyncTCP) task. Arduino.h (pulled in by
 // ESPAsyncWebServer.h via handler.h) provides the FreeRTOS types.
 extern SemaphoreHandle_t modbusBus;
+
+// Defined in src/main.cpp: same pattern for the shared relay PCF8574.
+extern SemaphoreHandle_t controlBus;
 
 namespace
 {
@@ -40,6 +45,30 @@ namespace
 
         ModbusGuard(const ModbusGuard&) = delete;
         ModbusGuard& operator=(const ModbusGuard&) = delete;
+
+        bool locked;
+    };
+
+    // RAII accessor for the shared relay PCF8574. Same bounded take/release
+    // semantics as ModbusGuard; !locked means the readback is unavailable and
+    // callers report null instead of a possibly torn value.
+    struct ControlGuard
+    {
+        ControlGuard()
+            : locked(controlBus != nullptr
+                  && xSemaphoreTake(controlBus, pdMS_TO_TICKS(200)) == pdTRUE)
+        {
+        }
+
+        ~ControlGuard()
+        {
+            if (locked) {
+                xSemaphoreGive(controlBus);
+            }
+        }
+
+        ControlGuard(const ControlGuard&) = delete;
+        ControlGuard& operator=(const ControlGuard&) = delete;
 
         bool locked;
     };
@@ -87,6 +116,7 @@ void Handler::init()
     // "/api/settings/modbus" and "/api/settings/meter".
     registerModbusSettingsHandlers();
     registerMeterSettingsHandlers();
+    registerControlHandlers();
 
     _networkApi->registerRoutes(*_server);
 
@@ -367,6 +397,12 @@ void Handler::setMap12E(EDWB::MAP12E* map12e)
     _map12e = map12e;
 }
 
+void Handler::setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light)
+{
+    _ventilationRelay = ventilation;
+    _light = light;
+}
+
 void Handler::sendModbusSettingsState(AsyncWebServerRequest* request, int status)
 {
     Config* config = _configMgr->getData();
@@ -619,6 +655,150 @@ void Handler::registerMeterSettingsHandlers()
             }
 
             sendMeterSettingsState(request, 200);
+        }
+    );
+    postHandler->setMethod(HTTP_POST);
+    postHandler->setMaxContentLength(1024);
+    _server->addHandler(postHandler);
+}
+
+void Handler::sendControlsState(
+    AsyncWebServerRequest* request,
+    int status,
+    std::pair<bool, bool> ventilation,
+    std::pair<bool, bool> light
+)
+{
+    AsyncResponseStream* response = request->beginResponseStream("application/json");
+    response->setCode(status);
+
+    std::string payload = EDUtils::buildJson([ventilation, light](JsonObject entity) {
+        if (ventilation.first) {
+            entity["ventilation"]["enabled"] = ventilation.second;
+        } else {
+            entity["ventilation"]["enabled"] = nullptr;
+        }
+
+        if (light.first) {
+            entity["light"]["enabled"] = light.second;
+        } else {
+            entity["light"]["enabled"] = nullptr;
+        }
+    });
+
+    response->write(payload.c_str());
+    request->send(response);
+}
+
+void Handler::registerControlHandlers()
+{
+    _server->on("/api/controls", HTTP_GET, [this](AsyncWebServerRequest* request) {
+        if (_ventilationRelay == nullptr || _light == nullptr) {
+            request->send(500, "application/json", "{\"message\": \"controls not initialized\"}");
+            return;
+        }
+
+        // A failed take leaves the readback unavailable; report null rather
+        // than a possibly torn value (same convention as the meter readings).
+        // The guard is scoped to the reads only, not the JSON serialization.
+        std::pair<bool, bool> ventilationState = {false, false};
+        std::pair<bool, bool> lightState = {false, false};
+
+        {
+            ControlGuard bus;
+            if (bus.locked) {
+                // The second pair member reports read validity; an invalid
+                // read is reported as disabled rather than failing the request.
+                const auto ventilation = _ventilationRelay->isEnabled();
+                const auto light = _light->isEnabled();
+
+                ventilationState = {true, ventilation.second && ventilation.first};
+                lightState = {true, light.second && light.first};
+            }
+        }
+
+        sendControlsState(request, 200, ventilationState, lightState);
+    });
+
+    auto* postHandler = new AsyncCallbackJsonWebHandler(
+        "/api/controls",
+        [this](AsyncWebServerRequest* request, JsonVariant& json) {
+            if (!json.is<JsonObject>()) {
+                request->send(422, "application/json", "{\"message\": \"invalid json\"}");
+                return;
+            }
+
+            if (_ventilationRelay == nullptr || _light == nullptr) {
+                request->send(500, "application/json", "{\"message\": \"controls not initialized\"}");
+                return;
+            }
+
+            const JsonVariant ventilationValue = json["ventilation"];
+            const JsonVariant lightValue = json["light"];
+
+            const bool hasVentilation = !ventilationValue.isNull();
+            const bool hasLight = !lightValue.isNull();
+
+            if (!hasVentilation && !hasLight) {
+                sendFieldError(request, "ventilation or light", "required");
+                return;
+            }
+
+            if (hasVentilation && !ventilationValue.is<bool>()) {
+                sendFieldError(request, "ventilation", "invalid value");
+                return;
+            }
+
+            if (hasLight && !lightValue.is<bool>()) {
+                sendFieldError(request, "light", "invalid value");
+                return;
+            }
+
+            // setState() only enqueues, so command delivery never depends on
+            // the guard; only the untouched-field readback can degrade to null.
+            bool ventilationEnabled = false;
+            bool ventilationEnqueued = true;
+            if (hasVentilation) {
+                ventilationEnabled = ventilationValue.as<bool>();
+                ventilationEnqueued = _ventilationRelay->setState(ventilationEnabled);
+            }
+
+            bool lightEnabled = false;
+            bool lightEnqueued = true;
+            if (hasLight) {
+                lightEnabled = lightValue.as<bool>();
+                lightEnqueued = _light->setState(lightEnabled);
+            }
+
+            // A full internal queue drops the command silently: report busy
+            // instead of echoing a 200 for a command that never landed.
+            if (!ventilationEnqueued || !lightEnqueued) {
+                request->send(500, "application/json", "{\"message\": \"controls busy\"}");
+                return;
+            }
+
+            std::pair<bool, bool> ventilationState = {true, ventilationEnabled};
+            std::pair<bool, bool> lightState = {true, lightEnabled};
+
+            if (!hasVentilation || !hasLight) {
+                // One guard instance shared by both readbacks; only acquired
+                // when an untouched field actually needs one.
+                ControlGuard bus;
+
+                if (!hasVentilation) {
+                    ventilationState = bus.locked
+                        ? std::make_pair(true, _ventilationRelay->isEnabled().first)
+                        : std::make_pair(false, false);
+                }
+
+                if (!hasLight) {
+                    lightState = bus.locked
+                        ? std::make_pair(true, _light->isEnabled().first)
+                        : std::make_pair(false, false);
+                }
+            }
+
+            sendControlsState(request, 200, ventilationState, lightState);
         }
     );
     postHandler->setMethod(HTTP_POST);

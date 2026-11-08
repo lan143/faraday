@@ -79,6 +79,20 @@ export interface MeterPayload {
   energySyncValue?: number;
 }
 
+/**
+ * One controllable relay in `GET /api/controls`. `enabled` is `null` when the
+ * live readback is unavailable (the relay bus was busy).
+ */
+export interface ControlsEntity {
+  enabled: boolean | null;
+}
+
+/** GET/POST /api/controls response. */
+export interface ControlsState {
+  ventilation: ControlsEntity;
+  light: ControlsEntity;
+}
+
 /** GET /healthcheck/healty (misspelled intentionally by the firmware lib). */
 export interface HealthResponse {
   healty: boolean;

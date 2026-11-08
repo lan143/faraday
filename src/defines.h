@@ -10,11 +10,18 @@
 #define ANALOG_A3 34
 #define ANALOG_A4 35
 
-// I2C bus (PCF8574 expanders; no domain logic attached yet).
+// I2C bus (PCF8574 expanders). The relay bank now has domain logic; the input
+// expander still has none.
 #define IIC_SDA 4
 #define IIC_SCL 5
 #define RELAY_IIC_ADDRESS 0x24   // PCF8574 output expander (relays)
-#define INPUT_IIC_ADDRESS 0x22   // PCF8574 input expander
+#define INPUT_IIC_ADDRESS 0x22   // PCF8574 input expander (no domain logic attached yet)
+
+// KC868-A8S relay bank on the PCF8574 @ RELAY_IIC_ADDRESS, 0-based channels.
+// Board relay K3 (1-based #3) = ventilation, K4 (#4) = light. The mapping is
+// hardware-unverified; change it here only.
+#define VENTILATION_RELAY_CHANNEL 2
+#define LIGHT_RELAY_CHANNEL 3
 
 // Shared sensor/LED connector (one device at a time: DS18B20 / DHT11 / DHT21 / LED strip #2)
 #define SENSOR_BUS_PIN 14

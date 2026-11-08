@@ -12,12 +12,14 @@ yet: it boots, mounts LittleFS, persists a raw `Config` in `/config.bin`, brings
 device, serves a Preact panel from LittleFS, exposes healthchecks and OTA, probes two PCF8574
 expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, and emits one boot beep.
 
-One domain now exists: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
+Two domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
 voltage, current, active power, reactive power, frequency and a software-offset supplier
-energy counter, plus CT-ratio and supplier-sync settings. There is still **no domain logic** for
-relays/inputs, GSM, RF433, LED strips, analog inputs, RS-485 devices other than the WB-MAP12E,
-or the buzzer beyond the boot beep. Those pins and objects are reserved for the next waves; do
-not describe them as working features. Target hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
+energy counter, plus CT-ratio and supplier-sync settings; and **relay control** — light and
+ventilation on the KC868-A8S relay bank through the PCF8574 output expander at `0x24`.
+There is still **no domain logic** for inputs (expander `0x22`), GSM, RF433, LED strips,
+analog inputs, RS-485 devices other than the WB-MAP12E, or the buzzer beyond the boot beep.
+Those pins and objects are reserved for the next waves; do not describe them as working
+features. Target hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
 `src/defines.h` declares model `ESP32-LAN8720`, with board revision **TBD**. PlatformIO board
 profile is `esp32dev`.
 
@@ -84,7 +86,7 @@ src/
 ├── defines.h                GPIO pins, serial speeds, identity, FW version define
 ├── config.h                 Config struct persisted raw to /config.bin; CURRENT_VERSION
 └── web/
-    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter routes
+    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/controls routes
     ├── backup_specs.h       BackupFileSpec table + /api/config handler configs
     └── reboot_after_response.h  Deferred reboot after the HTTP response is flushed
 frontend/                    Preact + TypeScript + Vite SPA sources (tabs incl. Modbus/Meter); npm run build -> data/
@@ -111,12 +113,17 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   `discoveryMgr`, `map12e` (`EDWB::MAP12E*`), six `EDCommon::Sensor::Sensor*` supplier
   pointers (`supplierEnergy`, `…Voltage`, `…Current`, `…Power`, `…ReactivePower`,
   `…Frequency`), two `PCF8574`
-  objects (`0x24` relay, `0x22` input) and `Handler`.
-- `setup()` order: random seed → `modbusBus` FreeRTOS binary semaphore (create + give, so the
-  bus guard boots unlocked) → `Serial` (115200) → verbose esp_log → LittleFS mount
+  objects (`0x24` relay, `0x22` input), two `EDCommon::Relay::PCF8574P` objects
+  (`ventilationRelay`, `lightRelay`, both over `relayExp`),
+  `EDCommon::Light::Relay light` (wraps `lightRelay`), the `controlBus` semaphore and
+  `Handler`.
+- `setup()` order: random seed → `modbusBus` + `controlBus` FreeRTOS binary semaphores
+  (create + give each, so both guards boot unlocked) → `Serial` (115200) → verbose esp_log →
+  LittleFS mount
   (early return on failure) → config defaults → `configMgr.load()` → network logger init →
   `Serial2.begin(config->modbusSpeed, …)` (RS-485) + `modbus.init(15)` → `Serial1` (GSM
-  placeholder) → `Wire` at 100 kHz → PCF8574 probes → `networkMgr.init(..., hasEth=true, ...)`
+  placeholder) → `Wire` at 100 kHz → PCF8574 probes (relay probe result stored in the
+  `relayExpPresent` flag) → `networkMgr.init(..., hasEth=true, ...)`
   → ArduinoOTA password/begin → MQTT init → network connect callback (logger + MQTT
   connect/disconnect) → healthcheck registers `mqtt` → network settings callback →
   `handler.init()` → HA discovery init + one `addDevice()` → `modbus.addMAP12E(config
@@ -126,10 +133,25 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   `energyMeterBase` pointers; `WBMAP12EVoltage` prec 1, 10 s; `WBMAP12ECurrent` prec 2, 10 s;
   `WBMAP12EActivePower` prec 0, 10 s; local `Faraday::WBMAP12EReactivePower` prec 0, 10 s;
   `WBMAP12EFrequency` prec 2, 10 s), each with MQTT +
-  discovery options → `inited = true` → one 2700 Hz / 150 ms boot beep.
+  discovery options → a `controlBus`-guarded block that runs only when `relayExpPresent`
+  (probe result stored in a flag; when absent the block and the following
+  `handler.setControls()` are skipped with a `LOGW`, so the handler pointers stay nullptr)
+  (`xSemaphoreTake(controlBus, portMAX_DELAY)` — **never skipped** once entered, because
+  skipping it would leave ventilation/light on uninitialized channels while the API is
+  still wired to them) initializing
+  `ventilationRelay` (MQTT + discovery) → `lightRelay` (channel only, no options) →
+  `light` (MQTT + discovery), then `handler.setControls(&ventilationRelay, &light)` →
+  `inited = true` → one 2700 Hz / 150 ms boot beep.
 - `loop()` order: `RebootAfterResponse::update()` first, then `networkMgr.loop()`,
   `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`, `modbus.loop()`,
-  the six null-guarded sensor `update()` calls, the electricity-status evaluation/publish
+  the six null-guarded sensor `update()` calls (inside the `modbusBus` block), a
+  `controlBus`-guarded `ventilationRelay.update()` + `light.update()` block **outside**
+  the `modbusBus` block, run only when `relayExpPresent` (the probe result stored in a
+  flag — the relay/light objects stay uninitialized when the expander is absent, so the
+  block is skipped entirely; otherwise 200 ms take, skipped on contention and retried next
+  iteration;
+  `Light::Relay::update()` also pumps the backing relay — never call `lightRelay.update()`
+  directly), the electricity-status evaluation/publish
   (outside the `modbusBus` block — `getValue()` is not bus access), then
   `networkLogger.update()`. When `inited`
   is false only the deferred-reboot check runs. Modbus bus access is serialized between the
@@ -140,7 +162,8 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   at their next interval), and the meter/modbus handlers in `src/web/handler.cpp` take the
   same semaphore through the RAII `ModbusGuard` (also 200 ms bounded).
   **Never block the loop**: no `delay()`, no long synchronous I/O; use
-  `esp_timer_get_time()` for intervals.
+  `esp_timer_get_time()` for intervals. Relay/light `setState()` is queue-only and never
+  needs the bus, so it is safe to call from the AsyncTCP task.
 - `ed-*` roles (all fetched under `.pio/libdeps/faraday/`; read them before guessing APIs):
   - `ed-config` — `EDConfig::DataMgr<T>` + `StorageLittleFS<T>` (`/config.bin` = raw
     `sizeof(Config)` + little-endian CRC16 trailer), plus `ConfigFileHandler` and
@@ -148,11 +171,14 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   - `ed-network` — `NetworkMgr` (Ethernet + Wi-Fi STA/AP + fallback AP) and `NetworkApi`
     (`/api/network/settings`, `/api/network/status`, `/api/wifi/list`).
   - `ed-mqtt` — `EDMQTT::MQTT` (AsyncMqttClient, reconnect/stuck reset, `Ready`) and
-    `EDMQTT::Consumer` for topic subscriptions. Faraday currently has no consumers.
+    `EDMQTT::Consumer` for topic subscriptions. Faraday has no app-level consumers; the
+    relay/light classes create their own internal command consumers during `init()`
+    (auto-subscribed to their `.../set` topics).
   - `ed-utils` — `EDUtils::LogConfig`/`NetworkLogger`, `formatString`, `getMacAddress`,
     `getChipID`, `buildJson`, `LOGx` macros.
-  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and the six WB-MAP12E
-    sensors register entities on it (unit/device class/state class).
+  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and entities of three
+    kinds register on it: the six WB-MAP12E sensors (unit/device class/state class), the
+    ventilation **switch** and the light **light**.
   - `ed-healthcheck` — `Ready` interface + `HealthCheck`; only `mqtt` is registered.
   - `ed-wb` — `EDWB::WirenBoard` (Modbus RTU client over `Stream`) + device drivers; Faraday
     uses `MAP12E` (`getVoltage`/`getCurrent`/`getActivePower`/`getReactivePower`/
@@ -161,6 +187,10 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   - `ed-common` — `EDCommon::Sensor::Sensor` base (precision, update interval, MQTT publish,
     HA discovery incl. `state_class`) and header-only `WBMAP12E*` subclasses. The energy
     sensor emulates a resettable counter with `energySyncValue` + (device − `energyMeterBase`).
+    Also `EDCommon::Relay::PCF8574P` (channel + shared PCF8574 driver; active-low ON = `LOW`
+    is hardcoded in it) and `EDCommon::Light::Relay` (light facade over a backing relay):
+    their `init()` auto-subscribes the MQTT command topic and registers the HA switch/light
+    entity when given MQTT/discovery options.
   - `ESPAsyncWebServer` — port 80, no authentication.
 - Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 3`) holds network, MQTT,
   HA-discovery flag/prefix, command/state/status topics, log settings, and the Modbus/WB-MAP12E
@@ -195,7 +225,12 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   `faraday/<chip>/supplier_energy*/state` (`supplier_energy`, `…_voltage`, `…_current`,
   `…_power`, `…_reactive_power`, `…_frequency`) and register discovery entities on the single
   device: `measurement` state class for voltage/current/power/reactive power/frequency and
-  `total_increasing` for the supplier energy counter.
+  `total_increasing` for the supplier energy counter. Ventilation and light use
+  `faraday/<chip>/ventilation/state|set` and `faraday/<chip>/light/state|set`: commands are
+  plain `on`/`off` (non-retained, auto-subscribed inside `init()`), state is published as
+  non-retained JSON `{"enabled":"on"}` with a 60 s heartbeat, and each registers an entity on
+  the same device — an HA **switch** for ventilation, an HA **light** for light. The backing
+  `lightRelay` is initialized with no options, so it owns no topics and registers nothing.
 - Electricity status: an `ElectricityStatus` enum (`OK`, `ON_BATTERY`; `ON_GENERATOR`/`FAIL`
   reserved for future generator/inverter logic and never entered) is derived from the L1
   voltage sensor with hysteresis — `OK` → `ON_BATTERY` at ≤0 V, `ON_BATTERY` → `OK` at >100 V,
@@ -214,10 +249,10 @@ ESPAsyncWebServer on port 80, **no authentication** (LAN-only device). Static fi
 served from LittleFS root at `/` with `index.html`; `/config.bin` is also exposed as a static
 file in addition to the `/api/config` download route. JSON responses use `application/json`.
 Mutating config handlers reply `200 {}` on success, `422 {"message": …}` on validation error
-and `500 {"message": …}` on storage failure unless noted; the Modbus and meter handlers are the
-exception — they reply `200` with the refreshed state. Those two endpoints (like
-`/api/log/settings`) take JSON bodies; `/api/settings/mqtt` is urlencoded and the config/backup
-routes take raw bodies.
+and `500 {"message": …}` on storage failure unless noted; the Modbus, meter and controls
+handlers are the exception — they reply `200` with the refreshed state. Those three endpoints
+(like `/api/log/settings`) take JSON bodies; `/api/settings/mqtt` is urlencoded and the
+config/backup routes take raw bodies.
 
 | Route | Method | Notes |
 |---|---|---|
@@ -241,13 +276,17 @@ routes take raw bodies.
 | `/api/settings/modbus` | POST | JSON (max 1024 B), both fields required: `modbusSpeed` one of 9600/19200/38400/57600/115200, `map12eAddress` 1–247; speed applies live (device register write on the old baud, then `Serial2.begin`), address after reboot; a `modbusBus` guard timeout logs `modbus bus busy` and skips only the device write while `Serial2` still switches; 422 `{"message":"<field>: required\|invalid value"}`, 500 store failure; 200 returns the refreshed state |
 | `/api/settings/meter` | GET | JSON `{ct1Ratio, energySyncValue, energyMeterBase, meterEnergy, supplierEnergy}`; the two live readings are `null` while the meter is unreachable or the bus guard times out (still 200) |
 | `/api/settings/meter` | POST | JSON (max 1024 B), at least one of `ct1Ratio` (0–65535) / `energySyncValue` (≥0); device CT write and/or energy read happen **before** store, so 500 `{"message":"meter unreachable"}` aborts without persisting (a bus-guard timeout takes the same path); 422 field errors; 200 returns the refreshed state |
+| `/api/controls` | GET | JSON `{"ventilation":{"enabled":bool\|null},"light":{"enabled":bool\|null}}`; a field is `null` when the live readback is unavailable because the 200 ms `controlBus` guard timed out (meter-null convention, still 200); 500 `{"message":"controls not initialized"}` before `handler.setControls()` wiring |
+| `/api/controls` | POST | JSON (max 1024 B), at least one of `ventilation`/`light` (booleans): neither → 422 `{"message":"ventilation or light: required"}`, non-bool → 422 `{"message":"<field>: invalid value"}`; `setState()` only enqueues (never needs the bus), 200 echoes the requested values for touched fields while the untouched field is a readback or `null` on guard timeout; `500 {"message":"controls busy"}` if a command enqueue fails (full internal queue — rare); no config store, no reboot |
 | `/healthcheck/healty` | GET | Always 200 `{"healty":true}` (the typo is the ed-healthcheck API) |
 | `/healthcheck/ready` | GET | 200 `{"ready":true,"message":…,"warning":…,"warningMessage":…}` or 500 `ready:false`; only the MQTT service is registered, so an unconfigured/disconnected broker shows not ready |
 
 Route registration order matters: `/api/config/backup` is registered before `/api/config`
 because the shorter matcher is backward-compatible and would otherwise swallow it. Likewise
 `/api/settings/modbus` and `/api/settings/meter` are registered before the plain
-`/api/settings` matcher. Reboots are deferred through `RebootAfterResponse` so the response
+`/api/settings` matcher. `/api/controls` is a distinct prefix with no matcher-order
+interaction with `/api/settings`, so it has no ordering constraint. Reboots are deferred
+through `RebootAfterResponse` so the response
 reaches the client; do not call `ESP.restart()` directly from a handler.
 
 ## Validation convention
@@ -338,7 +377,24 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   `service success count less min sucess count`, later `mqtt is not connected`).
   `/healthcheck/healty` is the liveness endpoint and is always 200.
 - PCF8574 probe failures at `0x24`/`0x22` are logged as warnings by design when no expanders
-  are attached; there is no relay/input domain logic yet.
+  are attached; with `0x24` missing the relay domain is disabled at boot — relay/light init
+  and handler wiring are skipped, no MQTT subscriptions or HA entities are registered, and
+  `/api/controls` replies 500 `{"message":"controls not initialized"}` (because a failed
+  PCF8574 read returns 0, which the active-low driver would report as ON), while the input
+  expander `0x22` still has no domain logic attached.
+- Relays are **ALL OFF after every boot/reboot**: `relayExp.begin()` writes `0xFF` to the
+  bank before any other write, and relay state is intentionally not persisted (no `Config`
+  fields added, `CURRENT_VERSION` stays 3) — there is no startup-state persistence by design.
+- The K3 → channel 2 (ventilation) / K4 → channel 3 (light) mapping and the active-low
+  ON = `LOW` follow the KC868-A8S assumption and are **hardware-unverified**; the channel
+  numbers live only in `src/defines.h` (`VENTILATION_RELAY_CHANNEL`, `LIGHT_RELAY_CHANNEL`) —
+  change them there only (the active-low polarity is hardcoded in `EDCommon::Relay::PCF8574P`).
+- I2C expander access is serialized by `controlBus` (200 ms bounded) between the loop task and
+  the web handlers: a contended `GET`/`POST /api/controls` readback returns `null` values, not
+  an error (the `POST` command itself still applies — `setState()` only enqueues).
+- `lightRelay` is initialized deliberately with **no MQTT/discovery options** so it does not
+  register a duplicate HA switch next to the light entity; only the `light` facade owns the
+  topics.
 - `env:faraday_ota` without a command-line target may build with the dev fallback OTA
   password and falls back to `esptool`; any actual upload target requires `.env` and fails
   early if either key is missing. Never put real credentials in the repo.
