@@ -1,0 +1,25 @@
+# Custom partition table for the standard 4MB ESP32 (esp32dev / Faraday).
+#
+# WHY: the scaffold firmware (1,130,240 B) fits the SDK default 1.25MB app
+# slot, but this table adds headroom for future domain code and libraries,
+# guarantees dual OTA app slots (~1.81MB each) and fixes a 320KB LittleFS
+# budget that fits the built UI (~140 KiB today) plus /config.bin; keeping the
+# whole table stable from the start avoids a second partition-migration flash.
+#
+# WARNING (flash layout): the first USB `pio run -e faraday -t upload` rewrites
+# the partition table and invalidates existing LittleFS contents (/config.bin).
+# After that first flash the device reboots into the default AP
+# (Faraday_<mac>) and must be reconfigured.
+#
+# OTA (`-t upload` over espota) cannot migrate the partition layout: switching
+# to this table requires exactly one USB flash. Subsequent OTA updates work
+# normally. Changing the table later repeats the same one-USB-flash +
+# LittleFS-wipe requirement.
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xd000,   0x2000,
+phy_init, data, phy,     0xf000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x1D0000,
+ota_1,    app,  ota_1,   0x1E0000, 0x1D0000,
+spiffs,   data, spiffs,  0x3B0000, 0x50000,

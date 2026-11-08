@@ -1,0 +1,302 @@
+#include <ArduinoJSON.h>
+#include <AsyncJson.h>
+#include <FS.h>
+#include <esp_system.h>
+#include <ExtStrings.h>
+#include <Json.h>
+#include <log/log.h>
+#include <cstring>
+#include <string.h>
+#include "defines.h"
+#include "handler.h"
+#include "web/reboot_after_response.h"
+
+namespace
+{
+    void sendLogSettingsState(AsyncWebServerRequest* request, int status)
+    {
+        const EDUtils::LogConfig config = networkLogger.getConfig();
+
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        response->setCode(status);
+
+        std::string payload = EDUtils::buildJson([&config](JsonObject entity) {
+            entity["host"] = config.host;
+            entity["uri"] = config.uri;
+            entity["port"] = config.port;
+            entity["enabled"] = networkLogger.isEnabled();
+        });
+
+        response->write(payload.c_str());
+        request->send(response);
+    }
+}
+
+void Handler::init()
+{
+    _server->serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+    _server->serveStatic("/config.bin", LittleFS, "/config.bin");
+
+    _healthCheck->registerHandlers(_server);
+
+    registerLogSettingsHandlers();
+
+    _networkApi->registerRoutes(*_server);
+
+    _server->on("/api/settings", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+
+        std::string payload = EDUtils::buildJson([this](JsonObject entity) {
+            Config* config = _configMgr->getData();
+
+            entity["mqttHost"] = config->mqtt.host;
+            entity["mqttPort"] = config->mqtt.port;
+            entity["mqttLogin"] = config->mqtt.login;
+            entity["mqttPassword"] = config->mqtt.password;
+            entity["mqttIsHADiscovery"] = config->mqttIsHADiscovery;
+            entity["mqttHADiscoveryPrefix"] = config->mqttHADiscoveryPrefix;
+            entity["mqttCommandTopic"] = config->mqttCommandTopic;
+            entity["mqttStateTopic"] = config->mqttStateTopic;
+        });
+
+        response->write(payload.c_str());
+        request->send(response);
+    });
+
+    _server->on("/api/settings/mqtt", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        if (
+            !request->hasParam("host", true)
+            || !request->hasParam("port", true)
+            || !request->hasParam("login", true)
+            || !request->hasParam("password", true)
+            || !request->hasParam("haDiscoveryPrefix", true)
+        ) {
+            request->send(422, "application/json", "{\"message\": \"not present mqtt params in request\"}");
+            return;
+        }
+
+        Config* config = _configMgr->getData();
+        const AsyncWebParameter* host = request->getParam("host", true);
+        const AsyncWebParameter* port = request->getParam("port", true);
+        const AsyncWebParameter* login = request->getParam("login", true);
+        const AsyncWebParameter* password = request->getParam("password", true);
+        const AsyncWebParameter* haDiscoveryPrefix = request->getParam("haDiscoveryPrefix", true);
+        const AsyncWebParameter* ishaDiscoveryEnabled = request->getParam("mqttIsHADiscovery", true);
+        const AsyncWebParameter* stateTopic = request->getParam("stateTopic", true);
+        const AsyncWebParameter* commandTopic = request->getParam("commandTopic", true);
+
+        if (host->value().length() == 0 || host->value().length() > HOST_LEN-1) {
+            request->send(422, "application/json", "{\"message\": \"MQTT host lenght invalid\"}");
+            return;
+        }
+
+        int mqttPort;
+        if (EDUtils::str2int(&mqttPort, port->value().c_str(), 10) != EDUtils::STR2INT_SUCCESS) {
+            request->send(422, "application/json", "{\"message\": \"Incorrect port\"}");
+            return;
+        }
+
+        if (login->value().length() > MQTT_LOGIN_LEN-1) {
+            request->send(422, "application/json", "{\"message\": \"MQTT login length invalid\"}");
+            return;
+        }
+
+        if (password->value().length() > MQTT_PASSWORD_LEN-1) {
+            request->send(422, "application/json", "{\"message\": \"MQTT password length invalid\"}");
+            return;
+        }
+
+        if (haDiscoveryPrefix->value().length() == 0) {
+            request->send(422, "application/json", "{\"message\": \"You must specify mqtt topic name\"}");
+            return;
+        }
+
+        if (haDiscoveryPrefix->value().length() > MQTT_TOPIC_LEN-1) {
+            request->send(422, "application/json", "{\"message\": \"HA discovery prefix length invalid\"}");
+            return;
+        }
+
+        if (stateTopic->value().length() == 0 || stateTopic->value().length() > MQTT_TOPIC_LEN-1) {
+            request->send(422, "application/json", "{\"message\": \"state topic length invalid\"}");
+            return;
+        }
+
+        if (commandTopic->value().length() == 0 || commandTopic->value().length() > MQTT_TOPIC_LEN-1) {
+            request->send(422, "application/json", "{\"message\": \"command topic length invalid\"}");
+            return;
+        }
+
+        strcpy(config->mqtt.host, host->value().c_str());
+        config->mqtt.port = (uint16_t)mqttPort;
+        strcpy(config->mqtt.login, login->value().c_str());
+        strcpy(config->mqtt.password, password->value().c_str());
+        strcpy(config->mqttHADiscoveryPrefix, haDiscoveryPrefix->value().c_str());
+        strcpy(config->mqttStateTopic, stateTopic->value().c_str());
+        strcpy(config->mqttCommandTopic, commandTopic->value().c_str());
+
+        if (strcmp(ishaDiscoveryEnabled->value().c_str(), "true") == 0) {
+            config->mqttIsHADiscovery = true;
+        } else {
+            config->mqttIsHADiscovery = false;
+        }
+
+        if (!_configMgr->store()) {
+            request->send(500, "application/json", "{\"message\": \"failed to save config\"}");
+            return;
+        }
+
+        request->send(200, "application/json", "{}");
+    });
+
+    _server->on("/api/status", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+
+        std::string data = EDUtils::buildJson([this](JsonObject entity) {
+            entity[F("freeHeap")] = ESP.getFreeHeap();
+            entity[F("uptime")] = esp_timer_get_time() / 1000000;
+
+            esp_reset_reason_t reason = esp_reset_reason();
+
+            switch (reason) {
+                case ESP_RST_POWERON:
+                    entity[F("lastResetReason")] = "Power-on Reset";
+                    break;
+                case ESP_RST_EXT:
+                    entity[F("lastResetReason")] = "External Reset";
+                    break;
+                case ESP_RST_SW:
+                    entity[F("lastResetReason")] = "Software Reset";
+                    break;
+                case ESP_RST_PANIC:
+                    entity[F("lastResetReason")] = "Panic Reset";
+                    break;
+                case ESP_RST_INT_WDT:
+                    entity[F("lastResetReason")] = "Interrupt Watchdog Reset";
+                    break;
+                case ESP_RST_TASK_WDT:
+                    entity[F("lastResetReason")] = "Task Watchdog Reset";
+                    break;
+                case ESP_RST_WDT:
+                    entity[F("lastResetReason")] = "Other Watchdog Reset";
+                    break;
+                case ESP_RST_DEEPSLEEP:
+                    entity[F("lastResetReason")] = "Wake from Deep Sleep";
+                    break;
+                case ESP_RST_BROWNOUT:
+                    entity[F("lastResetReason")] = "Brownout Reset";
+                    break;
+                case ESP_RST_SDIO:
+                    entity[F("lastResetReason")] = "SDIO Reset";
+                    break;
+                default:
+                    entity[F("lastResetReason")] = "Unknown";
+                    break;
+            }
+
+            entity[F("fwVersion")] = deviceFWVersion;
+        });
+        response->print(data.c_str());
+        request->send(response);
+    });
+
+    _server->on("/api/reboot", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        request->send(200, "application/json", "{}");
+        RebootAfterResponse::schedule(200);
+    });
+
+    // The backup endpoint must be registered before the single-file config
+    // endpoint (ed-config README requirement): a plain "/api/config" string
+    // matcher defaults to BackwardCompatible (WebServer.cpp:231), i.e. it also
+    // matches "/api/config/..." (WebServer.cpp:336); handlers are matched in
+    // registration order (_attachHandler, WebServer.cpp:142-151).
+    _configBackupHandler.registerHandlers(_server);
+
+    _configFileHandler.registerHandlers(_server);
+
+    _server->begin();
+}
+
+void Handler::registerLogSettingsHandlers()
+{
+    _server->on("/api/log/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
+        sendLogSettingsState(request, 200);
+    });
+
+    auto* postHandler = new AsyncCallbackJsonWebHandler(
+        "/api/log/settings",
+        [this](AsyncWebServerRequest* request, JsonVariant& json) {
+            if (!json.is<JsonObject>()) {
+                request->send(422, "application/json", "{\"message\": \"invalid json\"}");
+                return;
+            }
+
+            const JsonVariant hostValue = json["host"];
+            if (hostValue.isNull() || !hostValue.is<const char*>() || strlen(hostValue.as<const char*>()) == 0) {
+                request->send(422, "application/json", "{\"message\": \"host is required\"}");
+                return;
+            }
+
+            if (strlen(hostValue.as<const char*>()) >= LOG_HOST_LEN) {
+                request->send(422, "application/json", "{\"message\": \"host too long\"}");
+                return;
+            }
+
+            const JsonVariant uriValue = json["uri"];
+            if (uriValue.isNull() || !uriValue.is<const char*>() || strlen(uriValue.as<const char*>()) == 0) {
+                request->send(422, "application/json", "{\"message\": \"uri is required\"}");
+                return;
+            }
+
+            if (strlen(uriValue.as<const char*>()) >= LOG_HOST_LEN) {
+                request->send(422, "application/json", "{\"message\": \"uri too long\"}");
+                return;
+            }
+
+            const JsonVariant portValue = json["port"];
+            if (!portValue.is<int>() || portValue.as<int>() < 1 || portValue.as<int>() > 65535) {
+                request->send(422, "application/json", "{\"message\": \"invalid port\"}");
+                return;
+            }
+
+            const bool hasEnabled = !json["enabled"].isNull();
+            if (hasEnabled && !json["enabled"].is<bool>()) {
+                request->send(422, "application/json", "{\"message\": \"invalid enabled\"}");
+                return;
+            }
+
+            EDUtils::LogConfig config;
+            strncpy(config.host, hostValue.as<const char*>(), LOG_HOST_LEN - 1);
+            config.host[LOG_HOST_LEN - 1] = '\0';
+            strncpy(config.uri, uriValue.as<const char*>(), LOG_HOST_LEN - 1);
+            config.uri[LOG_HOST_LEN - 1] = '\0';
+            config.port = static_cast<uint16_t>(portValue.as<int>());
+
+            if (!networkLogger.setConfig(config)) {
+                request->send(422, "application/json", "{\"message\": \"invalid settings\"}");
+                return;
+            }
+
+            if (hasEnabled) {
+                networkLogger.enable(json["enabled"].as<bool>());
+            }
+
+            // "enabled" is deliberately runtime-only: it follows network connectivity.
+            Config* stored = _configMgr->getData();
+            strncpy(stored->log.host, config.host, LOG_HOST_LEN - 1);
+            stored->log.host[LOG_HOST_LEN - 1] = '\0';
+            strncpy(stored->log.uri, config.uri, LOG_HOST_LEN - 1);
+            stored->log.uri[LOG_HOST_LEN - 1] = '\0';
+            stored->log.port = config.port;
+
+            if (!_configMgr->store()) {
+                request->send(500, "application/json", "{\"message\": \"failed to store settings\"}");
+                return;
+            }
+
+            sendLogSettingsState(request, 200);
+        }
+    );
+    postHandler->setMethod(HTTP_POST);
+    postHandler->setMaxContentLength(1024);
+    _server->addHandler(postHandler);
+}
