@@ -10,13 +10,16 @@ Faraday is the **base controller skeleton** for a DIY ESP32 + LAN8720 board, mod
 yet: it boots, mounts LittleFS, persists a raw `Config` in `/config.bin`, brings up Ethernet
 (LAN8720) with Wi-Fi/AP fallback, connects to MQTT, creates one Home Assistant discovery
 device, serves a Preact panel from LittleFS, exposes healthchecks and OTA, probes two PCF8574
-expanders, and emits one boot beep.
+expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, and emits one boot beep.
 
-There is **no domain logic yet** for sensors, relays/inputs, GSM, RF433, LED strips, RS485,
-analog inputs or the buzzer beyond the boot beep. Those pins and objects are reserved for the
-next waves; do not describe them as working features. Target hardware is a generic 4 MB
-ESP32 + LAN8720 dev-board class; `src/defines.h` declares model `ESP32-LAN8720`, with board
-revision **TBD**. PlatformIO board profile is `esp32dev`.
+One domain now exists: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
+voltage, current, active power, frequency and a software-offset supplier energy counter, plus
+CT-ratio and supplier-sync settings. There is still **no domain logic** for relays/inputs, GSM,
+RF433, LED strips, analog inputs, RS-485 devices other than the WB-MAP12E, or the buzzer beyond
+the boot beep. Those pins and objects are reserved for the next waves; do not describe them as
+working features. Target hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
+`src/defines.h` declares model `ESP32-LAN8720`, with board revision **TBD**. PlatformIO board
+profile is `esp32dev`.
 
 ## Build & Deploy
 
@@ -30,6 +33,11 @@ are **no unit tests and no test command** — compilation is the primary local g
 - Serial monitor: `pio device monitor` (115200 8N1; run it plainly, not through `rtk`)
 - OTA firmware: `pio run -e faraday_ota -t upload` (`upload_protocol = espota`)
 - OTA filesystem: `pio run -e faraday_ota -t uploadfsota` (used by `make ui`)
+
+The env also sets
+`lib_ignore = ESPAsyncTCP, RPAsyncTCP`: those ESP8266/Raspberry Pi TCP stacks leak in
+transitively through library manifests, and a clean dependency resolve breaks unless they are
+excluded (`AsyncTCP` is the ESP32 stack). Keep both entries when editing `lib_deps`.
 
 OTA target and auth come from the **untracked** project-root `/.env` (copy `.env.example`):
 `FARADAY_OTA_IP` and `FARADAY_OTA_AUTH`. `scripts/ota_env.py` injects them into
@@ -57,8 +65,8 @@ back up or restore by itself; only `deploy` does. `HOST`, `PIO`, `WAIT_INITIAL`,
 
 Partition layout (`partitions.csv`): two app slots `0x1D0000` = 1,900,544 B (~1.81 MiB) each
 at `0x10000` / `0x1E0000`, and the LittleFS `spiffs` data slot at `0x3B0000` with size
-`0x50000` = 327,680 B (320 KiB). The current scaffold firmware is 1,130,240 B
-(~1.08 MiB / ~1.13 MB); `data/` is ~140 KiB (`du -sk data`). `make` warns when `data/`
+`0x50000` = 327,680 B (320 KiB). The current firmware is 1,175,472 B
+(~1.12 MiB / ~1.18 MB); `data/` is ~148 KiB (`du -sk data`). `make` warns when `data/`
 exceeds 262,144 B (80% of the 327,680 B slot) but still attempts the upload; the device
 reports the real failure.
 
@@ -76,10 +84,10 @@ src/
 ├── defines.h                GPIO pins, serial speeds, identity, FW version define
 ├── config.h                 Config struct persisted raw to /config.bin; CURRENT_VERSION
 └── web/
-    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log routes
+    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter routes
     ├── backup_specs.h       BackupFileSpec table + /api/config handler configs
     └── reboot_after_response.h  Deferred reboot after the HTTP response is flushed
-frontend/                    Preact + TypeScript + Vite SPA sources; npm run build -> data/
+frontend/                    Preact + TypeScript + Vite SPA sources (tabs incl. Modbus/Meter); npm run build -> data/
 data/                        Built web UI served from LittleFS (index.html + assets/)
 scripts/
 ├── ota_env.py               Injects .env OTA IP/auth into env:faraday_ota
@@ -92,24 +100,41 @@ Makefile                     OTA deploy orchestration (deploy/backup/restore/sta
 
 `data/` is build output from `frontend/` — edit the frontend source, not the bundle.
 `frontend/package.json` pulls the network/config/log web components from the sibling
-`ed-network`, `ed-config` and `ed-utils` packages via `file:../../…/frontend` dependencies.
+`ed-network`, `ed-config` and `ed-utils` packages via `file:../../…/frontend` dependencies;
+the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are local pages.
 
 ## Architecture
 
 - Single-threaded cooperative Arduino loop. Globals are constructed at file scope in
   `src/main.cpp`: `configMgr` (`EDConfig::DataMgr<Config>` + `StorageLittleFS("/config.bin")`),
-  `networkMgr`, `networkApi`, `mqtt`, `healthCheck`, `discoveryMgr`, two `PCF8574` objects
-  (`0x24` relay, `0x22` input) and `Handler`.
-- `setup()` order: random seed → `Serial` (115200) → verbose esp_log → LittleFS mount
+  `networkMgr`, `networkApi`, `mqtt`, `modbus` (`EDWB::WirenBoard` on `Serial2`), `healthCheck`,
+  `discoveryMgr`, `map12e` (`EDWB::MAP12E*`), five `EDCommon::Sensor::Sensor*` supplier
+  pointers (`supplierEnergy`, `…Voltage`, `…Current`, `…Power`, `…Frequency`), two `PCF8574`
+  objects (`0x24` relay, `0x22` input) and `Handler`.
+- `setup()` order: random seed → `modbusBus` FreeRTOS binary semaphore (create + give, so the
+  bus guard boots unlocked) → `Serial` (115200) → verbose esp_log → LittleFS mount
   (early return on failure) → config defaults → `configMgr.load()` → network logger init →
-  `Serial2` (RS485 placeholder) → `Serial1` (GSM placeholder) → `Wire` at 100 kHz → PCF8574
-  probes → `networkMgr.init(..., hasEth=true, ...)` → ArduinoOTA password/begin → MQTT init →
-  network connect callback (logger + MQTT connect/disconnect) → healthcheck registers `mqtt`
-  → network settings callback → `handler.init()` → HA discovery init + one `addDevice()` →
-  `inited = true` → one 2700 Hz / 150 ms boot beep.
+  `Serial2.begin(config->modbusSpeed, …)` (RS-485) + `modbus.init(15)` → `Serial1` (GSM
+  placeholder) → `Wire` at 100 kHz → PCF8574 probes → `networkMgr.init(..., hasEth=true, ...)`
+  → ArduinoOTA password/begin → MQTT init → network connect callback (logger + MQTT
+  connect/disconnect) → healthcheck registers `mqtt` → network settings callback →
+  `handler.init()` → HA discovery init + one `addDevice()` → `modbus.addMAP12E(config
+  address)` + `handler.setMap12E()` → CT-ratio reconciliation (read the device ratio, write
+  the stored one back only if it differs; `LOGW` when the meter is unreachable) → five sensor
+  objects (`WBMAP12EEnergy` ch 1/L1, precision 2, 60 s, with the `energySyncValue`/
+  `energyMeterBase` pointers; `WBMAP12EVoltage` prec 1, 10 s; `WBMAP12ECurrent` prec 2, 10 s;
+  `WBMAP12EActivePower` prec 0, 10 s; `WBMAP12EFrequency` prec 2, 10 s), each with MQTT +
+  discovery options → `inited = true` → one 2700 Hz / 150 ms boot beep.
 - `loop()` order: `RebootAfterResponse::update()` first, then `networkMgr.loop()`,
-  `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`,
-  `networkLogger.update()`. When `inited` is false only the deferred-reboot check runs.
+  `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`, `modbus.loop()`,
+  the five null-guarded sensor `update()` calls, then `networkLogger.update()`. When `inited`
+  is false only the deferred-reboot check runs. Modbus bus access is serialized between the
+  loop task and the web handlers (AsyncTCP task) by a FreeRTOS binary semaphore
+  `modbusBus` (created and initially given as one of the first `setup()` actions): `loop()`
+  wraps `modbus.loop()` + the five `update()` calls in a `xSemaphoreTake(modbusBus, 200 ms)` /
+  `xSemaphoreGive` pair and skips the whole bus-touching block on contention (sensors retry
+  at their next interval), and the meter/modbus handlers in `src/web/handler.cpp` take the
+  same semaphore through the RAII `ModbusGuard` (also 200 ms bounded).
   **Never block the loop**: no `delay()`, no long synchronous I/O; use
   `esp_timer_get_time()` for intervals.
 - `ed-*` roles (all fetched under `.pio/libdeps/faraday/`; read them before guessing APIs):
@@ -122,22 +147,33 @@ Makefile                     OTA deploy orchestration (deploy/backup/restore/sta
     `EDMQTT::Consumer` for topic subscriptions. Faraday currently has no consumers.
   - `ed-utils` — `EDUtils::LogConfig`/`NetworkLogger`, `formatString`, `getMacAddress`,
     `getChipID`, `buildJson`, `LOGx` macros.
-  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, but **no entities are
-    registered yet**, so nothing is published to HA discovery until a domain adds entities.
+  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and the five WB-MAP12E
+    sensors register entities on it (unit/device class/state class).
   - `ed-healthcheck` — `Ready` interface + `HealthCheck`; only `mqtt` is registered.
+  - `ed-wb` — `EDWB::WirenBoard` (Modbus RTU client over `Stream`) + device drivers; Faraday
+    uses `MAP12E` (`getVoltage`/`getCurrent`/`getActivePower`/`getFrequency`/
+    `getForwardActiveEnergy`, `getCTTransformRatio`/`setCTTransformRatio`), channel 1 / L1.
+  - `ed-common` — `EDCommon::Sensor::Sensor` base (precision, update interval, MQTT publish,
+    HA discovery incl. `state_class`) and header-only `WBMAP12E*` subclasses. The energy
+    sensor emulates a resettable counter with `energySyncValue` + (device − `energyMeterBase`).
   - `ESPAsyncWebServer` — port 80, no authentication.
-- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 1`) holds network, MQTT,
-  HA-discovery flag/prefix, command/state topics and log settings. The MQTT portion is
-  exposed at `GET /api/settings` and written by `POST /api/settings/mqtt`, which mutates the
-  in-RAM `Config` and calls `configMgr.store()`; the whole struct is persisted raw to
-  `/config.bin` by `EDConfig::DataMgr<Config>`/`StorageLittleFS` (CRC16 trailer). Defaults
-  are installed in
+- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 2`) holds network, MQTT,
+  HA-discovery flag/prefix, command/state topics, log settings, and the Modbus/WB-MAP12E
+  fields (`modbusSpeed` default 9600, `map12eAddress` default 1, `map12eCt1Ratio` default 0,
+  `energySyncValue`, `energyMeterBase`). The MQTT portion is exposed at `GET /api/settings` and
+  written by `POST /api/settings/mqtt`, which mutates the in-RAM `Config` and calls
+  `configMgr.store()`; the Modbus and meter sections have their own JSON endpoints. The whole
+  struct is persisted raw to `/config.bin` by `EDConfig::DataMgr<Config>`/`StorageLittleFS`
+  (CRC16 trailer). Defaults are installed in
   `setup()`: AP SSID `Faraday_<MAC>`, MQTT topics `faraday/<chip>/state` and
   `faraday/<chip>/set`, discovery prefix `homeassistant`, log host `192.168.1.2:5555/_bulk`.
   `load()` falls back to defaults and stores when the CRC/size is invalid. Changes are
-  persisted immediately by their handlers; MQTT changes take effect after a reboot, while
-  network and log settings apply live. There is no migration layer yet — a layout change
-  requires bumping `CURRENT_VERSION` and adding one (or restore will reject old backups).
+  persisted immediately by their handlers; MQTT changes take effect after a reboot, network
+  and log settings apply live, Modbus speed applies live (device register write on the old
+  baud, then local `Serial2.begin`), the MAP12E address applies after a reboot, and meter
+  CT-ratio/sync writes hit the device before being stored. There is **no migration layer**:
+  a layout change requires bumping `CURRENT_VERSION`, so a v1 `/config.bin` fails the
+  CRC/size check and is silently replaced by defaults, and v1 backups are rejected on restore.
 - Backup specs currently contain only `config.bin`; append future domain state files to
   `BackupSpecs::kBackupFiles` (and bump the archive cap only with a reason — the library
   default is 16 KiB).
@@ -148,7 +184,12 @@ Makefile                     OTA deploy orchestration (deploy/backup/restore/sta
   settings are applied after a ~300 ms defer so the HTTP response is flushed first.
 - MQTT/HA: `mqtt.init()` no-ops with an empty host. On network connect the logger is enabled
   and MQTT is connected; on disconnect MQTT is disconnected. `DiscoveryMgr::loop()` sends
-  discovery after ~10 s and retries until the send function succeeds (unless disabled).
+  discovery after ~10 s and retries until the send function succeeds (unless disabled). The
+  five sensor objects publish retained plain values on
+  `faraday/<chip>/supplier_energy*/state` (`supplier_energy`, `…_voltage`, `…_current`,
+  `…_power`, `…_frequency`) and register discovery entities on the single device:
+  `measurement` state class for voltage/current/power/frequency and `total_increasing` for
+  the supplier energy counter.
 - Logging: `LOGD/LOGI/LOGW/LOGE(tag, fmt, …)` from ed-utils; short tags (`"setup"`, `"main"`,
   `"network"`, …). `NetworkLogger` keeps two 16 KiB buffers, flushes the previous buffer every
   10 s while network is connected, and POSTs `text/plain` with `X-SYSTEM`/`X-INSTANCE`
@@ -160,7 +201,10 @@ ESPAsyncWebServer on port 80, **no authentication** (LAN-only device). Static fi
 served from LittleFS root at `/` with `index.html`; `/config.bin` is also exposed as a static
 file in addition to the `/api/config` download route. JSON responses use `application/json`.
 Mutating config handlers reply `200 {}` on success, `422 {"message": …}` on validation error
-and `500 {"message": …}` on storage failure unless noted.
+and `500 {"message": …}` on storage failure unless noted; the Modbus and meter handlers are the
+exception — they reply `200` with the refreshed state. Those two endpoints (like
+`/api/log/settings`) take JSON bodies; `/api/settings/mqtt` is urlencoded and the config/backup
+routes take raw bodies.
 
 | Route | Method | Notes |
 |---|---|---|
@@ -180,13 +224,18 @@ and `500 {"message": …}` on storage failure unless noted.
 | `/api/wifi/list` | GET | `{networks:[{ssid,rssi,channel,encrypted}]}`; 500 `{"error":"scan failed"}` |
 | `/api/log/settings` | GET | `{host, uri, port, enabled}` |
 | `/api/log/settings` | POST | JSON (max 1024 B): `host`/`uri` required and <64 chars, `port` 1–65535, optional bool `enabled`; host/uri/port persist, `enabled` is runtime-only and follows connectivity; 200 returns the state |
+| `/api/settings/modbus` | GET | JSON `{modbusSpeed, map12eAddress}` (RS-485 speed, MAP12E unit id) |
+| `/api/settings/modbus` | POST | JSON (max 1024 B), both fields required: `modbusSpeed` one of 9600/19200/38400/57600/115200, `map12eAddress` 1–247; speed applies live (device register write on the old baud, then `Serial2.begin`), address after reboot; a `modbusBus` guard timeout logs `modbus bus busy` and skips only the device write while `Serial2` still switches; 422 `{"message":"<field>: required\|invalid value"}`, 500 store failure; 200 returns the refreshed state |
+| `/api/settings/meter` | GET | JSON `{ct1Ratio, energySyncValue, energyMeterBase, meterEnergy, supplierEnergy}`; the two live readings are `null` while the meter is unreachable or the bus guard times out (still 200) |
+| `/api/settings/meter` | POST | JSON (max 1024 B), at least one of `ct1Ratio` (0–65535) / `energySyncValue` (≥0); device CT write and/or energy read happen **before** store, so 500 `{"message":"meter unreachable"}` aborts without persisting (a bus-guard timeout takes the same path); 422 field errors; 200 returns the refreshed state |
 | `/healthcheck/healty` | GET | Always 200 `{"healty":true}` (the typo is the ed-healthcheck API) |
 | `/healthcheck/ready` | GET | 200 `{"ready":true,"message":…,"warning":…,"warningMessage":…}` or 500 `ready:false`; only the MQTT service is registered, so an unconfigured/disconnected broker shows not ready |
 
 Route registration order matters: `/api/config/backup` is registered before `/api/config`
-because the shorter matcher is backward-compatible and would otherwise swallow it. Reboots
-are deferred through `RebootAfterResponse` so the response reaches the client; do not call
-`ESP.restart()` directly from a handler.
+because the shorter matcher is backward-compatible and would otherwise swallow it. Likewise
+`/api/settings/modbus` and `/api/settings/meter` are registered before the plain
+`/api/settings` matcher. Reboots are deferred through `RebootAfterResponse` so the response
+reaches the client; do not call `ESP.restart()` directly from a handler.
 
 ## Validation convention
 
@@ -197,8 +246,9 @@ are deferred through `RebootAfterResponse` so the response reaches the client; d
   into `data/` with `emptyOutDir: true`.
 - Hardware-dependent and **not verifiable locally**: OTA/espota, partition-table migration,
   LittleFS wear/space, LAN8720 PHY/clock, fallback AP timing, I2C expander presence, serial
-  pin mux, buzzer/LED boot strapping, RF433/ETH clock interaction, and long-uptime timing.
-  Say plainly what was not verified in the final report.
+  pin mux, buzzer/LED boot strapping, RF433/ETH clock interaction, the RS-485 bus /
+  auto-direction transceiver assumption, WB-MAP12E reachability/CT scaling, and long-uptime
+  timing. Say plainly what was not verified in the final report.
 - After documentation or config changes, re-check pins against `src/defines.h`, routes
   against `src/web/handler.cpp` plus the `ed-*` route registrations, and all size numbers
   against `partitions.csv` and the build artifacts.
@@ -224,15 +274,43 @@ are deferred through `RebootAfterResponse` so the response reaches the client; d
 - `RF433_RX_PIN` is GPIO16, adjacent to the Ethernet 50 MHz clock output on GPIO17
   (`ETH_CLOCK_GPIO17_OUT`). Verify the schematic/PCB before using RF433 and Ethernet
   together; the RF433 domain is not implemented.
-- `RS485_SPEED` (19200) and `GSM_SPEED` (115200) are placeholder bauds; `Serial2` on
-  GPIO32/33 and `Serial1` on GPIO13/15 are initialized but no protocol runs. Do not treat
-  them as a working RS485/GSM implementation.
+- `RS485_SPEED` no longer exists; `Serial2` on GPIO32/33 runs Modbus RTU at the configured
+  `modbusSpeed` (9600…115200). There is **no DE/RE direction pin** in `src/defines.h` — the
+  code assumes an auto-direction RS-485 transceiver; verify the hardware before relying on it.
+  `Serial1` on GPIO13/15 and `GSM_SPEED` (115200) are still placeholders — no GSM protocol
+  runs. Do not treat GSM as implemented.
+- WB-MAP12E energy counters are **read-only and can never be reset** by Modbus. The supplier
+  total is emulated: `energySyncValue + (deviceEnergy − energyMeterBase)`. A UI "sync" stores
+  the entered supplier reading and the device counter at that moment — do not "fix" a wrong
+  counter by looking for a reset register.
+- Changing the CT ratio changes how the meter scales current/power/energy, so it invalidates
+  the energy history used by the sync offset; re-sync the supplier energy after a ratio change.
+- The boot CT-ratio reconciliation overwrites a meter-side ratio that differs from the stored
+  config value (e.g. after a config reset a hand-set meter ratio becomes 0) — set the ratio
+  via the Meter tab so it is persisted in config and reconciled back to the meter.
+- Modbus reads run synchronously in the loop task (bounded ~15 ms per transaction timeout,
+  worst-case single-iteration stall when the meter is absent ~135 ms); within the
+  never-block-the-loop rule this is the accepted cost — the bus is serialized by the
+  `modbusBus` semaphore rather than made asynchronous.
+- `POST /api/settings/modbus` writes the new speed to the bus (ed-wb broadcasts the speed
+  register to Modbus address 0) **before** switching the local `Serial2` baud; the address
+  change only takes effect after a reboot. The endpoint stores config first, so a failed device
+  write logs a warning but is not rolled back. If the bus guard times out (`modbus bus busy`
+  warning) the device-side write is skipped but `Serial2` still switches to the persisted
+  speed; nothing rewrites the meter's speed register at boot, so the device side stays at the
+  old baud until the speed write is re-applied.
+- `CURRENT_VERSION` is 2 with **no migration layer**: an old v1 `/config.bin` fails the
+  CRC/size check and is silently replaced by defaults, and v1 backups are rejected on restore
+  (version byte mismatch).
+- `ed-wb` and `ed-common` are git-pinned (`ed-wb#dfa808b1…`, `ed-common#0.6.0`); the WB-MAP12E
+  support and the sensor family ship in those releases; `lib_ignore = ESPAsyncTCP, RPAsyncTCP`
+  must stay or a clean resolve pulls the wrong TCP stacks.
 - `cd frontend && npm run build` uses Vite `emptyOutDir: true` and **rewrites `data/`**,
   deleting untracked fixtures. Re-run `-t uploadfs` (or `make ui`/`make deploy`) to get the
   new bundle onto the device.
-- The repo currently has **no commits**, so both `scripts/platformio_version.py` and the Vite
-  config resolve the version to `unknown`; the panel footer shows `FW unknown` / `UI unknown`.
-  After the first commit they show `<hash>` or `<tag>-<hash>[-dirty]`.
+- Both `scripts/platformio_version.py` and the Vite config derive the version from git; with
+  only the initial commit and a dirty tree they resolve to `<hash>-dirty`. Before the first
+  commit they resolved to `unknown`, and the panel footer showed `FW unknown` / `UI unknown`.
 - The firmware exposes `/config.bin` both statically and via `/api/config`, and
   `/api/settings` returns the MQTT password in plaintext. Backups contain the same secrets.
   Treat all of them as sensitive; never commit `.env`, `build/deploy/` or backups.

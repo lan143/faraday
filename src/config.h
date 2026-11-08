@@ -9,7 +9,7 @@
 #include "defines.h"
 
 // Bump whenever the persisted layout changes (fields reordered/renamed/retyped).
-#define CURRENT_VERSION 1
+#define CURRENT_VERSION 2
 
 #define MQTT_TOPIC_LEN 64
 
@@ -26,4 +26,16 @@ struct Config
     char mqttStateTopic[MQTT_TOPIC_LEN] = {0};
 
     EDUtils::LogConfig log;
+
+    // RS485 / WB-MAP12E energy meter.
+    uint32_t modbusSpeed = 9600;
+    uint8_t map12eAddress = 1;
+    uint16_t map12eCt1Ratio = 0;
+    // WB-MAP12E forward-active-energy counters are read-only and can never be
+    // reset, so the supplier reading is emulated in software: HA value =
+    // energySyncValue + (deviceEnergy - energyMeterBase). energySyncValue is
+    // the supplier kWh reading captured at the last sync; energyMeterBase is
+    // the MAP12E counter at that same moment.
+    float energySyncValue = 0.0f;
+    float energyMeterBase = 0.0f;
 };

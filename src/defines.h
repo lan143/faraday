@@ -33,10 +33,9 @@
 #define ETH_TYPE ETH_PHY_LAN8720
 #define ETH_CLK_MODE ETH_CLOCK_GPIO17_OUT
 
-// RS485 (Serial2). Speed is a placeholder until the RS485 domain lands.
+// RS485 (Serial2). Speed is config-driven (Config::modbusSpeed).
 #define RS485_RX 32
 #define RS485_TX 33
-#define RS485_SPEED 19200
 
 // GSM module (Serial1). Baud is a placeholder until the GSM domain lands.
 #define GSM_RX 13

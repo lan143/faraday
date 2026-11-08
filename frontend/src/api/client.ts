@@ -2,6 +2,10 @@ import type {
   DeviceStatus,
   EmptyObject,
   HealthResponse,
+  MeterPayload,
+  MeterSettings,
+  ModbusPayload,
+  ModbusSettings,
   MqttPayload,
   ReadyResponse,
   Settings,
@@ -54,6 +58,20 @@ export const LIMITS = {
     /** `mqttStateTopic` / `mqttCommandTopic` must be 1..63 chars. */
     topicMin: 1,
     topicMax: 63,
+  },
+  modbus: {
+    /** Exactly the speeds `handler.cpp` accepts, in ascending order. */
+    speeds: [9600, 19200, 38400, 57600, 115200] as const,
+    /** Modbus unit id; `handler.cpp` rejects anything outside 1..247. */
+    addressMin: 1,
+    addressMax: 247,
+  },
+  meter: {
+    /** `uint16_t` register value; 0 disables the CT ratio. */
+    ctRatioMin: 0,
+    ctRatioMax: 65535,
+    /** Supplier kWh reading must be finite and non-negative. */
+    syncMin: 0,
   },
 } as const;
 
@@ -158,6 +176,52 @@ function sendForm(path: string, body: URLSearchParams): Promise<ActionResult> {
   });
 }
 
+/**
+ * POST a JSON body and parse the refreshed state the endpoint returns. This
+ * mirrors `getJson`: a non-2xx response surfaces the firmware `{message}` and
+ * an empty/unparseable 200 uses `emptyMessage`.
+ */
+async function postJson<T>(
+  path: string,
+  body: unknown,
+  emptyMessage: string,
+): Promise<ApiResult<T>> {
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return networkFailure();
+  }
+
+  if (!res.ok) {
+    return failureFromResponse(res);
+  }
+
+  let text: string;
+  try {
+    text = await res.text();
+  } catch {
+    return { ok: false, status: res.status, message: NETWORK_MESSAGE };
+  }
+
+  if (!text.trim()) {
+    return { ok: false, status: res.status, message: emptyMessage };
+  }
+
+  try {
+    return { ok: true, data: JSON.parse(text) as T };
+  } catch {
+    return { ok: false, status: res.status, message: emptyMessage };
+  }
+}
+
 /** GET /api/status */
 export function getStatus(): Promise<ApiResult<DeviceStatus>> {
   return getJson<DeviceStatus>('/api/status', EMPTY_BODY_MESSAGE);
@@ -236,4 +300,94 @@ export function postMqtt(payload: MqttPayload): Promise<ActionResult> {
   body.set('stateTopic', stateTopic);
   body.set('commandTopic', commandTopic);
   return sendForm('/api/settings/mqtt', body);
+}
+
+/** GET /api/settings/modbus — RS-485 speed and MAP12E address. */
+export function getModbusSettings(): Promise<ApiResult<ModbusSettings>> {
+  return getJson<ModbusSettings>(
+    '/api/settings/modbus',
+    EMPTY_BODY_MESSAGE,
+  );
+}
+
+/**
+ * POST /api/settings/modbus — persists both fields and returns the refreshed
+ * state. The speed applies live; the address takes effect after a reboot.
+ * Invalid input throws client-side instead of being sent.
+ */
+export function saveModbusSettings(
+  payload: ModbusPayload,
+): Promise<ApiResult<ModbusSettings>> {
+  if (!(LIMITS.modbus.speeds as readonly number[]).includes(payload.modbusSpeed)) {
+    throw new Error(
+      `Modbus speed must be one of ${LIMITS.modbus.speeds.join(', ')}.`,
+    );
+  }
+  if (
+    !Number.isInteger(payload.map12eAddress) ||
+    payload.map12eAddress < LIMITS.modbus.addressMin ||
+    payload.map12eAddress > LIMITS.modbus.addressMax
+  ) {
+    throw new Error(
+      `MAP12E address must be an integer between ${LIMITS.modbus.addressMin} and ${LIMITS.modbus.addressMax}.`,
+    );
+  }
+  return postJson<ModbusSettings>(
+    '/api/settings/modbus',
+    {
+      modbusSpeed: payload.modbusSpeed,
+      map12eAddress: payload.map12eAddress,
+    },
+    EMPTY_BODY_MESSAGE,
+  );
+}
+
+/** GET /api/settings/meter — CT ratio, sync value and live meter readings. */
+export function getMeterSettings(): Promise<ApiResult<MeterSettings>> {
+  return getJson<MeterSettings>('/api/settings/meter', EMPTY_BODY_MESSAGE);
+}
+
+/**
+ * POST /api/settings/meter — sends only the provided fields and returns the
+ * refreshed state. A CT ratio write reaches the meter immediately; a sync
+ * stores the entered supplier reading plus the meter counter at that moment.
+ * Invalid input throws client-side instead of being sent.
+ */
+export function saveMeterSettings(
+  payload: MeterPayload,
+): Promise<ApiResult<MeterSettings>> {
+  const body: MeterPayload = {};
+
+  if (payload.ct1Ratio !== undefined) {
+    if (
+      !Number.isInteger(payload.ct1Ratio) ||
+      payload.ct1Ratio < LIMITS.meter.ctRatioMin ||
+      payload.ct1Ratio > LIMITS.meter.ctRatioMax
+    ) {
+      throw new Error(
+        `CT ratio must be an integer between ${LIMITS.meter.ctRatioMin} and ${LIMITS.meter.ctRatioMax}.`,
+      );
+    }
+    body.ct1Ratio = payload.ct1Ratio;
+  }
+
+  if (payload.energySyncValue !== undefined) {
+    if (
+      !Number.isFinite(payload.energySyncValue) ||
+      payload.energySyncValue < LIMITS.meter.syncMin
+    ) {
+      throw new Error('Energy sync value must be a number greater than or equal to 0.');
+    }
+    body.energySyncValue = payload.energySyncValue;
+  }
+
+  if (body.ct1Ratio === undefined && body.energySyncValue === undefined) {
+    throw new Error('ct1Ratio or energySyncValue required.');
+  }
+
+  return postJson<MeterSettings>(
+    '/api/settings/meter',
+    body,
+    EMPTY_BODY_MESSAGE,
+  );
 }

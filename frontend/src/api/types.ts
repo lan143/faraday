@@ -46,6 +46,37 @@ export interface MqttPayload {
   commandTopic: string;
 }
 
+/** GET /api/settings/modbus — persisted RS-485 speed and MAP12E address. */
+export interface ModbusSettings {
+  modbusSpeed: number;
+  map12eAddress: number;
+}
+
+/** POST /api/settings/modbus body (JSON). Both fields are required. */
+export interface ModbusPayload {
+  modbusSpeed: number;
+  map12eAddress: number;
+}
+
+/**
+ * GET /api/settings/meter — persisted CT ratio/sync value plus the live
+ * readings. `meterEnergy`/`supplierEnergy` are `null` while the meter is
+ * unreachable.
+ */
+export interface MeterSettings {
+  ct1Ratio: number;
+  energySyncValue: number;
+  energyMeterBase: number;
+  meterEnergy: number | null;
+  supplierEnergy: number | null;
+}
+
+/** POST /api/settings/meter body (JSON); at least one field is required. */
+export interface MeterPayload {
+  ct1Ratio?: number;
+  energySyncValue?: number;
+}
+
 /** GET /healthcheck/healty (misspelled intentionally by the firmware lib). */
 export interface HealthResponse {
   healty: boolean;

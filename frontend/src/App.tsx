@@ -4,15 +4,26 @@ import { TabBar, type TabItem } from './components/TabBar';
 import { StatusPage } from './pages/Status';
 import { NetworkPage } from './pages/Network';
 import { MqttPage } from './pages/Mqtt';
+import { ModbusPage } from './pages/Modbus';
+import { MeterPage } from './pages/Meter';
 import { ConfigPage } from './pages/Config';
 import { LoggerSettingsPage } from './pages/Logger';
 
-type TabId = 'status' | 'network' | 'mqtt' | 'config' | 'logger';
+type TabId =
+  | 'status'
+  | 'network'
+  | 'mqtt'
+  | 'modbus'
+  | 'meter'
+  | 'config'
+  | 'logger';
 
 const TABS: ReadonlyArray<TabItem<TabId>> = [
   { id: 'status', label: 'Status' },
   { id: 'network', label: 'Network' },
   { id: 'mqtt', label: 'MQTT' },
+  { id: 'modbus', label: 'Modbus' },
+  { id: 'meter', label: 'Meter' },
   { id: 'config', label: 'Config' },
   { id: 'logger', label: 'Log' },
 ];
@@ -25,6 +36,10 @@ function renderPanel(tab: TabId) {
       return <NetworkPage />;
     case 'mqtt':
       return <MqttPage />;
+    case 'modbus':
+      return <ModbusPage />;
+    case 'meter':
+      return <MeterPage />;
     case 'config':
       return <ConfigPage />;
     case 'logger':
