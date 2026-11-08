@@ -9,7 +9,7 @@
 #include "defines.h"
 
 // Bump whenever the persisted layout changes (fields reordered/renamed/retyped).
-#define CURRENT_VERSION 2
+#define CURRENT_VERSION 3
 
 #define MQTT_TOPIC_LEN 64
 
@@ -24,6 +24,7 @@ struct Config
     char mqttHADiscoveryPrefix[MQTT_TOPIC_LEN] = {0};
     char mqttCommandTopic[MQTT_TOPIC_LEN] = {0};
     char mqttStateTopic[MQTT_TOPIC_LEN] = {0};
+    char mqttStatusTopic[MQTT_TOPIC_LEN] = {0};
 
     EDUtils::LogConfig log;
 

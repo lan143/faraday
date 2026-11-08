@@ -271,7 +271,7 @@ function requireString(
 /**
  * POST /api/settings/mqtt — applies after reboot.
  *
- * Always sends all eight parameters, as prometey does: the firmware reads
+ * Always sends all nine parameters, as prometey does: the firmware reads
  * `stateTopic`, `commandTopic` and `mqttIsHADiscovery` without presence checks
  * (handler.cpp:84-86), so omitting any would crash the device. Invalid input
  * throws client-side instead of being sent.
@@ -289,6 +289,7 @@ export function postMqtt(payload: MqttPayload): Promise<ActionResult> {
   }
   const stateTopic = requireString(payload.stateTopic, 'State topic', LIMITS.mqtt.topicMax);
   const commandTopic = requireString(payload.commandTopic, 'Command topic', LIMITS.mqtt.topicMax);
+  const statusTopic = requireString(payload.statusTopic, 'Status topic', LIMITS.mqtt.topicMax);
 
   const body = new URLSearchParams();
   body.set('host', host);
@@ -299,6 +300,7 @@ export function postMqtt(payload: MqttPayload): Promise<ActionResult> {
   body.set('mqttIsHADiscovery', payload.mqttIsHADiscovery ? 'true' : 'false');
   body.set('stateTopic', stateTopic);
   body.set('commandTopic', commandTopic);
+  body.set('statusTopic', statusTopic);
   return sendForm('/api/settings/mqtt', body);
 }
 

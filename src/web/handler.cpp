@@ -104,6 +104,7 @@ void Handler::init()
             entity["mqttHADiscoveryPrefix"] = config->mqttHADiscoveryPrefix;
             entity["mqttCommandTopic"] = config->mqttCommandTopic;
             entity["mqttStateTopic"] = config->mqttStateTopic;
+            entity["mqttStatusTopic"] = config->mqttStatusTopic;
         });
 
         response->write(payload.c_str());
@@ -131,6 +132,11 @@ void Handler::init()
         const AsyncWebParameter* ishaDiscoveryEnabled = request->getParam("mqttIsHADiscovery", true);
         const AsyncWebParameter* stateTopic = request->getParam("stateTopic", true);
         const AsyncWebParameter* commandTopic = request->getParam("commandTopic", true);
+        // Optional: clients predating the electricity-status topic do not send
+        // it; in that case the stored value is left unchanged.
+        const AsyncWebParameter* statusTopic = request->hasParam("statusTopic", true)
+            ? request->getParam("statusTopic", true)
+            : nullptr;
 
         if (host->value().length() == 0 || host->value().length() > HOST_LEN-1) {
             request->send(422, "application/json", "{\"message\": \"MQTT host lenght invalid\"}");
@@ -173,6 +179,11 @@ void Handler::init()
             return;
         }
 
+        if (statusTopic != nullptr && (statusTopic->value().length() == 0 || statusTopic->value().length() > MQTT_TOPIC_LEN-1)) {
+            request->send(422, "application/json", "{\"message\": \"status topic length invalid\"}");
+            return;
+        }
+
         strcpy(config->mqtt.host, host->value().c_str());
         config->mqtt.port = (uint16_t)mqttPort;
         strcpy(config->mqtt.login, login->value().c_str());
@@ -180,6 +191,9 @@ void Handler::init()
         strcpy(config->mqttHADiscoveryPrefix, haDiscoveryPrefix->value().c_str());
         strcpy(config->mqttStateTopic, stateTopic->value().c_str());
         strcpy(config->mqttCommandTopic, commandTopic->value().c_str());
+        if (statusTopic != nullptr) {
+            strcpy(config->mqttStatusTopic, statusTopic->value().c_str());
+        }
 
         if (strcmp(ishaDiscoveryEnabled->value().c_str(), "true") == 0) {
             config->mqttIsHADiscovery = true;

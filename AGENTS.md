@@ -127,7 +127,9 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   discovery options → `inited = true` → one 2700 Hz / 150 ms boot beep.
 - `loop()` order: `RebootAfterResponse::update()` first, then `networkMgr.loop()`,
   `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`, `modbus.loop()`,
-  the five null-guarded sensor `update()` calls, then `networkLogger.update()`. When `inited`
+  the five null-guarded sensor `update()` calls, the electricity-status evaluation/publish
+  (outside the `modbusBus` block — `getValue()` is not bus access), then
+  `networkLogger.update()`. When `inited`
   is false only the deferred-reboot check runs. Modbus bus access is serialized between the
   loop task and the web handlers (AsyncTCP task) by a FreeRTOS binary semaphore
   `modbusBus` (created and initially given as one of the first `setup()` actions): `loop()`
@@ -157,8 +159,8 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
     HA discovery incl. `state_class`) and header-only `WBMAP12E*` subclasses. The energy
     sensor emulates a resettable counter with `energySyncValue` + (device − `energyMeterBase`).
   - `ESPAsyncWebServer` — port 80, no authentication.
-- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 2`) holds network, MQTT,
-  HA-discovery flag/prefix, command/state topics, log settings, and the Modbus/WB-MAP12E
+- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 3`) holds network, MQTT,
+  HA-discovery flag/prefix, command/state/status topics, log settings, and the Modbus/WB-MAP12E
   fields (`modbusSpeed` default 9600, `map12eAddress` default 1, `map12eCt1Ratio` default 0,
   `energySyncValue`, `energyMeterBase`). The MQTT portion is exposed at `GET /api/settings` and
   written by `POST /api/settings/mqtt`, which mutates the in-RAM `Config` and calls
@@ -166,14 +168,15 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   struct is persisted raw to `/config.bin` by `EDConfig::DataMgr<Config>`/`StorageLittleFS`
   (CRC16 trailer). Defaults are installed in
   `setup()`: AP SSID `Faraday_<MAC>`, MQTT topics `faraday/<chip>/state` and
-  `faraday/<chip>/set`, discovery prefix `homeassistant`, log host `192.168.1.2:5555/_bulk`.
+  `faraday/<chip>/set`, electricity status topic `faraday/<chip>/status`, discovery prefix
+  `homeassistant`, log host `192.168.1.2:5555/_bulk`.
   `load()` falls back to defaults and stores when the CRC/size is invalid. Changes are
   persisted immediately by their handlers; MQTT changes take effect after a reboot, network
   and log settings apply live, Modbus speed applies live (device register write on the old
   baud, then local `Serial2.begin`), the MAP12E address applies after a reboot, and meter
   CT-ratio/sync writes hit the device before being stored. There is **no migration layer**:
-  a layout change requires bumping `CURRENT_VERSION`, so a v1 `/config.bin` fails the
-  CRC/size check and is silently replaced by defaults, and v1 backups are rejected on restore.
+  a layout change requires bumping `CURRENT_VERSION`, so a v2 `/config.bin` fails the
+  CRC/size check and is silently replaced by defaults, and v2 backups are rejected on restore.
 - Backup specs currently contain only `config.bin`; append future domain state files to
   `BackupSpecs::kBackupFiles` (and bump the archive cap only with a reason — the library
   default is 16 KiB).
@@ -190,6 +193,13 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   `…_power`, `…_frequency`) and register discovery entities on the single device:
   `measurement` state class for voltage/current/power/frequency and `total_increasing` for
   the supplier energy counter.
+- Electricity status: an `ElectricityStatus` enum (`OK`, `ON_BATTERY`; `ON_GENERATOR`/`FAIL`
+  reserved for future generator/inverter logic and never entered) is derived from the L1
+  voltage sensor with hysteresis — `OK` → `ON_BATTERY` at ≤0 V, `ON_BATTERY` → `OK` at >100 V,
+  the 0–100 V band holds the current state. The retained plain-text payload (`OK`/`ON_BATTERY`)
+  is published to `config->mqttStatusTopic` (default `faraday/<chipID>/status`) on the first
+  valid meter reading and on every state change; a failed publish stays pending and is
+  retried once MQTT reconnects. Nothing is published before the first valid reading.
 - Logging: `LOGD/LOGI/LOGW/LOGE(tag, fmt, …)` from ed-utils; short tags (`"setup"`, `"main"`,
   `"network"`, …). `NetworkLogger` keeps two 16 KiB buffers, flushes the previous buffer every
   10 s while network is connected, and POSTs `text/plain` with `X-SYSTEM`/`X-INSTANCE`
@@ -210,8 +220,8 @@ routes take raw bodies.
 |---|---|---|
 | `/` | GET | LittleFS static UI, default `index.html` |
 | `/config.bin` | GET | Raw persisted config (contains Wi-Fi/MQTT secrets) |
-| `/api/settings` | GET | MQTT section: `mqttHost`, `mqttPort`, `mqttLogin`, `mqttPassword` (plaintext), `mqttIsHADiscovery`, `mqttHADiscoveryPrefix`, `mqttCommandTopic`, `mqttStateTopic` |
-| `/api/settings/mqtt` | POST | Urlencoded. Requires `host`, `port`, `login`, `password`, `haDiscoveryPrefix` via `hasParam`; `stateTopic`, `commandTopic`, `mqttIsHADiscovery` are read **without** presence checks — omitting them crashes the device. Lengths ≤63/≤31/≤31/≤63/≤63. Persists immediately; reboot to apply. UI also enforces port 1–65535; firmware parses base-10 and casts to `uint16_t` |
+| `/api/settings` | GET | MQTT section: `mqttHost`, `mqttPort`, `mqttLogin`, `mqttPassword` (plaintext), `mqttIsHADiscovery`, `mqttHADiscoveryPrefix`, `mqttCommandTopic`, `mqttStateTopic`, `mqttStatusTopic` |
+| `/api/settings/mqtt` | POST | Urlencoded. Requires `host`, `port`, `login`, `password`, `haDiscoveryPrefix` via `hasParam`; `stateTopic`, `commandTopic`, `mqttIsHADiscovery` are read **without** presence checks — omitting them crashes the device. `statusTopic` is optional (omitting it leaves the stored value unchanged). Lengths ≤63/≤31/≤31/≤63/≤63/≤63/≤63. Persists immediately; reboot to apply. UI also enforces port 1–65535; firmware parses base-10 and casts to `uint16_t` |
 | `/api/status` | GET | `{freeHeap, uptime (s), lastResetReason, fwVersion}` |
 | `/api/reboot` | POST | Replies `{}` then schedules a restart after a 200 ms grace period |
 | `/api/config` | GET | Raw `/config.bin` (`application/octet-stream`); 404 JSON if absent |
@@ -299,9 +309,9 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   warning) the device-side write is skipped but `Serial2` still switches to the persisted
   speed; nothing rewrites the meter's speed register at boot, so the device side stays at the
   old baud until the speed write is re-applied.
-- `CURRENT_VERSION` is 2 with **no migration layer**: an old v1 `/config.bin` fails the
-  CRC/size check and is silently replaced by defaults, and v1 backups are rejected on restore
-  (version byte mismatch).
+- `CURRENT_VERSION` is 3 with **no migration layer**: an old v2 `/config.bin` fails the
+  CRC/size check and is silently replaced by defaults, and v2 backups are rejected on restore
+  (member size check, with the version byte as a second guard).
 - `ed-wb` and `ed-common` are git-pinned (`ed-wb#dfa808b1…`, `ed-common#0.6.0`); the WB-MAP12E
   support and the sensor family ship in those releases; `lib_ignore = ESPAsyncTCP, RPAsyncTCP`
   must stay or a clean resolve pulls the wrong TCP stacks.
@@ -315,7 +325,8 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   `/api/settings` returns the MQTT password in plaintext. Backups contain the same secrets.
   Treat all of them as sensitive; never commit `.env`, `build/deploy/` or backups.
 - `/api/settings/mqtt` dereferences `stateTopic`, `commandTopic` and `mqttIsHADiscovery`
-  without checking they were sent. Always send all eight fields (the panel does).
+  without checking they were sent. Always send all nine fields (the panel does; the firmware
+  treats `statusTopic` as optional, but the panel always sends it).
 - `/api/config` and `/api/config/backup` only accept raw bodies (no multipart), and restore
   rejects archives whose `config.bin` version byte or CRC does not match the running
   `CURRENT_VERSION`. A restore reboots the device.

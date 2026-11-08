@@ -20,6 +20,7 @@ interface MqttForm {
   mqttIsHADiscovery: boolean;
   stateTopic: string;
   commandTopic: string;
+  statusTopic: string;
 }
 
 interface MqttErrors {
@@ -30,6 +31,7 @@ interface MqttErrors {
   haDiscoveryPrefix?: string;
   stateTopic?: string;
   commandTopic?: string;
+  statusTopic?: string;
 }
 
 const EMPTY_MQTT: MqttForm = {
@@ -41,6 +43,7 @@ const EMPTY_MQTT: MqttForm = {
   mqttIsHADiscovery: false,
   stateTopic: '',
   commandTopic: '',
+  statusTopic: '',
 };
 
 function validateMqtt(form: MqttForm): MqttErrors {
@@ -84,6 +87,12 @@ function validateMqtt(form: MqttForm): MqttErrors {
       'Required - the device crashes if the command topic is missing.';
   } else if (form.commandTopic.length > LIMITS.mqtt.topicMax) {
     errors.commandTopic = `At most ${LIMITS.mqtt.topicMax} characters.`;
+  }
+
+  if (form.statusTopic.trim().length === 0) {
+    errors.statusTopic = 'Status topic is required.';
+  } else if (form.statusTopic.length > LIMITS.mqtt.topicMax) {
+    errors.statusTopic = `At most ${LIMITS.mqtt.topicMax} characters.`;
   }
 
   return errors;
@@ -222,6 +231,7 @@ export function MqttPage() {
         mqttIsHADiscovery: result.data.mqttIsHADiscovery,
         stateTopic: result.data.mqttStateTopic,
         commandTopic: result.data.mqttCommandTopic,
+        statusTopic: result.data.mqttStatusTopic,
       });
     } else {
       setLoadError(result.message);
@@ -258,6 +268,7 @@ export function MqttPage() {
           mqttIsHADiscovery: mqtt.mqttIsHADiscovery,
           stateTopic: mqtt.stateTopic,
           commandTopic: mqtt.commandTopic,
+          statusTopic: mqtt.statusTopic,
         });
         if (result.ok) {
           setMqttNotice('MQTT settings saved to flash.');
@@ -360,6 +371,15 @@ export function MqttPage() {
             autoComplete="off"
             error={mqttErrors.commandTopic}
             help="Must not be empty: the device crashes on a missing command topic."
+          />
+          <TextField
+            label="Топик статуса электричества"
+            value={mqtt.statusTopic}
+            onInput={(value) => updateMqtt({ statusTopic: value })}
+            maxLength={LIMITS.mqtt.topicMax}
+            autoComplete="off"
+            error={mqttErrors.statusTopic}
+            help="По умолчанию: faraday/<chipID>/status."
           />
           {mqttNotice ? (
             <Banner

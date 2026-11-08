@@ -57,6 +57,33 @@ Handler handler(&configMgr, &networkApi, &healthCheck, &modbus);
 
 bool inited = false;
 
+// Electricity state derived from the WB-MAP12E L1 voltage with hysteresis.
+// Only OK/ON_BATTERY are emitted in the current domain scope; ON_GENERATOR/FAIL
+// are reserved for future generator/inverter logic and never transitioned to.
+enum class ElectricityStatus { OK, ON_BATTERY, ON_GENERATOR, FAIL };
+
+static const char* electricityStatusText(ElectricityStatus status)
+{
+    switch (status) {
+        case ElectricityStatus::ON_BATTERY:
+            return "ON_BATTERY";
+        case ElectricityStatus::ON_GENERATOR:
+            return "ON_GENERATOR";
+        case ElectricityStatus::FAIL:
+            return "FAIL";
+        case ElectricityStatus::OK:
+            break;
+    }
+
+    return "OK";
+}
+
+// The status is only published after the first valid meter reading so the
+// initial retained message reflects reality instead of an assumption.
+static ElectricityStatus electricityStatus = ElectricityStatus::OK;
+static bool electricityStatusEverRead = false;
+static bool electricityStatusPublishPending = false;
+
 void setup()
 {
     randomSeed(micros());
@@ -83,6 +110,7 @@ void setup()
     configMgr.setDefault([](Config* config) {
         snprintf(config->network.wifiAPSSID, WIFI_SSID_LEN, "Faraday_%s", EDUtils::getMacAddress().c_str());
         snprintf(config->mqttStateTopic, MQTT_TOPIC_LEN, "faraday/%s/state", EDUtils::getChipID());
+        snprintf(config->mqttStatusTopic, MQTT_TOPIC_LEN, "faraday/%s/status", EDUtils::getChipID());
         snprintf(config->mqttCommandTopic, MQTT_TOPIC_LEN, "faraday/%s/set", EDUtils::getChipID());
         snprintf(config->mqttHADiscoveryPrefix, MQTT_TOPIC_LEN, "homeassistant");
         snprintf(config->log.host, LOG_HOST_LEN, "192.168.1.2");
@@ -254,5 +282,43 @@ void loop()
         if (supplierEnergyFrequency) supplierEnergyFrequency->update();
         xSemaphoreGive(modbusBus);
     }
+
+    // Cheap, no bus access: derive the electricity state from the last valid
+    // L1 voltage reading and publish it retained on change. getValue() only
+    // returns a valid pair once the sensor has produced a reading, so nothing
+    // is published before the meter has been read at least once.
+    if (supplierEnergyVoltage != nullptr) {
+        auto voltage = supplierEnergyVoltage->getValue();
+        if (voltage.second) {
+            const bool firstReading = !electricityStatusEverRead;
+            const ElectricityStatus previous = electricityStatus;
+
+            if (firstReading) {
+                electricityStatusEverRead = true;
+                electricityStatus = voltage.first <= 0.0f
+                    ? ElectricityStatus::ON_BATTERY
+                    : ElectricityStatus::OK;
+            } else if (electricityStatus == ElectricityStatus::OK && voltage.first <= 0.0f) {
+                electricityStatus = ElectricityStatus::ON_BATTERY;
+            } else if (electricityStatus == ElectricityStatus::ON_BATTERY && voltage.first > 100.0f) {
+                electricityStatus = ElectricityStatus::OK;
+            }
+
+            if (electricityStatus != previous) {
+                LOGI("status", "electricity status: %s (%0.1f V)", electricityStatusText(electricityStatus), voltage.first);
+            }
+
+            if (firstReading || electricityStatus != previous) {
+                electricityStatusPublishPending = true;
+            }
+        }
+    }
+
+    if (electricityStatusPublishPending && electricityStatusEverRead && mqtt.isConnected()) {
+        if (mqtt.publish(configMgr.getData()->mqttStatusTopic, electricityStatusText(electricityStatus), true)) {
+            electricityStatusPublishPending = false;
+        }
+    }
+
     networkLogger.update();
 }

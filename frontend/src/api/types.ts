@@ -28,10 +28,11 @@ export interface Settings {
   mqttHADiscoveryPrefix: string;
   mqttCommandTopic: string;
   mqttStateTopic: string;
+  mqttStatusTopic: string;
 }
 
 /**
- * POST /api/settings/mqtt body (urlencoded). All eight parameters are always
+ * POST /api/settings/mqtt body (urlencoded). All nine parameters are always
  * sent: the firmware reads `stateTopic`, `commandTopic` and `mqttIsHADiscovery`
  * without presence checks and would crash if any were absent.
  */
@@ -44,6 +45,7 @@ export interface MqttPayload {
   mqttIsHADiscovery: boolean;
   stateTopic: string;
   commandTopic: string;
+  statusTopic: string;
 }
 
 /** GET /api/settings/modbus — persisted RS-485 speed and MAP12E address. */
