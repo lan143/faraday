@@ -1,12 +1,14 @@
 #include "bms_client.h"
 
 #include <NimBLEAddress.h>
+#include <NimBLEAdvertisedDevice.h>
 #include <NimBLEClient.h>
 #include <NimBLEDevice.h>
 #include <NimBLERemoteCharacteristic.h>
 #include <NimBLERemoteService.h>
 #include <NimBLEScan.h>
 #include <NimBLEUUID.h>
+#include <Arduino.h>
 #include <esp_timer.h>
 #include <log/log.h>
 
@@ -49,6 +51,20 @@ struct Faraday::Bms::Client::Impl
         bool connected = false;
     };
 
+    // Streaming advertisement adapter. onResult() runs on the NimBLE host task,
+    // so it only copies plain data into the mutex-guarded scan table (no NimBLE
+    // calls inside the lock).
+    struct ScanCallbacks : NimBLEAdvertisedDeviceCallbacks
+    {
+        Impl* impl = nullptr;
+        void onResult(NimBLEAdvertisedDevice* device) override
+        {
+            if (impl != nullptr) {
+                impl->onAdvertised(device);
+            }
+        }
+    };
+
     Client* owner = nullptr;
     TaskHandle_t task = nullptr;
     QueueHandle_t rxQueue = nullptr;
@@ -69,11 +85,44 @@ struct Faraday::Bms::Client::Impl
     // lock() for those reads, keeping lock() calls strictly paired).
     bool bleUnavailable = false;
 
+    // Scan completion edge set by scanCompleteShim() on the NimBLE host task.
+    // Written from the host task, read by the bms task; the bms task also runs
+    // a hard deadline, so a lost/stale edge is harmless. volatile is enough for
+    // a single word flag; no lock is taken in the completion path.
+    volatile bool scanCompleted = false;
+    ScanCallbacks scanCallbacks;
+    // Points at the active Impl while a scan runs so the static completion
+    // callback can wake the owning task. Only one scan can be active.
+    static Impl* scanOwner;
+
     // Task-only state (only the bms task touches these, no locking needed).
     bool bleInitialized = false;
     NimBLEClient* bleClient = nullptr;
     NimBLERemoteCharacteristic* cmdChar = nullptr;
     Protocol::FrameAssembler assembler;
+    int64_t lastHeapWarnAtUs = 0;
+
+    // Pure deferral: never marks bleUnavailable, so a later boot state with more
+    // free heap can still bring BLE up. Rate-limited to one warning per ~30 s.
+    bool bleHeapAvailable(uint32_t freeHeap)
+    {
+        if (freeHeap >= BMS_MIN_FREE_HEAP_FOR_BLE) {
+            return true;
+        }
+
+        const int64_t now = esp_timer_get_time();
+        if (lastHeapWarnAtUs == 0 || (now - lastHeapWarnAtUs) >= 30000000LL) {
+            lastHeapWarnAtUs = now;
+            LOGW(
+                "bms",
+                "BLE deferred: free heap %u < %u",
+                (unsigned)freeHeap,
+                (unsigned)BMS_MIN_FREE_HEAP_FOR_BLE
+            );
+        }
+
+        return false;
+    }
 
     bool initBle()
     {
@@ -81,12 +130,15 @@ struct Faraday::Bms::Client::Impl
             return true;
         }
 
+        const uint32_t heapBefore = ESP.getFreeHeap();
         LOGI("bms", "initializing BLE");
         NimBLEDevice::init("Faraday-BMS");
         bleInitialized = NimBLEDevice::getInitialized();
 
         if (!bleInitialized) {
             LOGE("bms", "BLE initialization failed");
+        } else {
+            LOGI("bms", "BLE up, heap %u->%u", (unsigned)heapBefore, (unsigned)ESP.getFreeHeap());
         }
 
         return bleInitialized;
@@ -266,11 +318,16 @@ struct Faraday::Bms::Client::Impl
                 markBleUnavailable();
                 return outcome;
             }
+            // NimBLE 1.4.x: setConnectTimeout() takes SECONDS.
             bleClient->setConnectTimeout(10);
         }
 
-        const NimBLEAddress peer(std::string(mac));
-        if (!bleClient->connect(peer)) {
+        // Brace/explicit construction is mandatory: `NimBLEAddress peer(std::string(mac))`
+        // is a most-vexing-parse (it declares a function), which silently bound
+        // connect(peer) to the connect(bool) overload and dialed the zero address.
+        const std::string peerMac(mac);
+        const NimBLEAddress peer{peerMac, BLE_ADDR_PUBLIC};
+        if (!bleClient->connect(peer, true)) {
             LOGW("bms", "BLE connect failed to %s", mac);
             updateConnected(false);
             if (configChanged(generation)) {
@@ -311,7 +368,7 @@ struct Faraday::Bms::Client::Impl
             return outcome;
         }
 
-        bool subscribed = notifyChar->subscribe(
+        const bool subscribed = notifyChar->subscribe(
             true,
             [this](NimBLERemoteCharacteristic*, uint8_t* pData, size_t length, bool) {
                 if (length == 0 || rxQueue == nullptr) {
@@ -329,28 +386,6 @@ struct Faraday::Bms::Client::Impl
             },
             false
         );
-
-        if (!subscribed) {
-            // Some peers require an acknowledged CCCD write.
-            subscribed = notifyChar->subscribe(
-                true,
-                [this](NimBLERemoteCharacteristic*, uint8_t* pData, size_t length, bool) {
-                    if (length == 0 || rxQueue == nullptr) {
-                        return;
-                    }
-
-                    RxChunk chunk;
-                    chunk.len = static_cast<uint16_t>(std::min<size_t>(length, sizeof(chunk.data)));
-                    memcpy(chunk.data, pData, chunk.len);
-                    xQueueSend(rxQueue, &chunk, 0);
-
-                    if (task != nullptr) {
-                        xTaskNotifyGive(task);
-                    }
-                },
-                true
-            );
-        }
 
         if (!subscribed) {
             LOGE("bms", "failed to subscribe to 0xFF01");
@@ -489,29 +524,92 @@ struct Faraday::Bms::Client::Impl
         return outcome;
     }
 
-    void clearScanState()
+    // NimBLE host-task scan-completion hook. Only marks the edge and wakes the
+    // bms task; the task also owns a hard deadline, so losing this wakeup is
+    // harmless.
+    static void scanCompleteShim(NimBLEScanResults)
+    {
+        Impl* impl = scanOwner;
+        if (impl == nullptr) {
+            return;
+        }
+
+        impl->scanCompleted = true;
+
+        if (impl->task != nullptr) {
+            xTaskNotifyGive(impl->task);
+        }
+    }
+
+    // Called from the NimBLE host task for every advertisement (wantDuplicates
+    // gives us RSSI updates). NimBLE accessors run before the lock; only plain
+    // data is copied while the mutex is held.
+    void onAdvertised(NimBLEAdvertisedDevice* device)
+    {
+        const std::string mac = device->getAddress().toString();
+        if (mac.empty()) {
+            return;
+        }
+        const std::string name = device->haveName() ? device->getName() : std::string();
+        const int rssi = device->getRSSI();
+
+        owner->lock();
+
+        for (uint16_t i = 0; i < scanResultCount; ++i) {
+            if (strcasecmp(scanResults[i].mac, mac.c_str()) == 0) {
+                if (rssi > scanResults[i].rssi) {
+                    scanResults[i].rssi = rssi;
+                    if (!name.empty()) {
+                        snprintf(scanResults[i].name, sizeof(scanResults[i].name), "%s", name.c_str());
+                    }
+                }
+                owner->unlock();
+                return;
+            }
+        }
+
+        if (scanResultCount < BMS_MAX_SCAN_RESULTS) {
+            BmsScanResult& entry = scanResults[scanResultCount];
+            snprintf(entry.mac, sizeof(entry.mac), "%s", mac.c_str());
+            snprintf(entry.name, sizeof(entry.name), "%s", name.c_str());
+            entry.rssi = rssi;
+            ++scanResultCount;
+        }
+
+        owner->unlock();
+    }
+
+    void finalizeScan()
     {
         owner->lock();
         scanning = false;
         ++scanGeneration;
+        const uint16_t count = scanResultCount;
         owner->unlock();
+
+        LOGI("bms", "BLE scan done: %u device(s)", (unsigned)count);
     }
 
-    void performScan()
+    void performScan(uint32_t generation)
     {
         disconnect();
 
         if (bleUnavailable) {
             // Task-local fast path: raw read, no lock() (see the declaration).
-            clearScanState();
+            finalizeScan();
             return;
         }
 
         if (!bleInitialized) {
+            // Deferred scan: memory is tight, so abort rather than starve Wi-Fi.
+            if (!bleHeapAvailable(ESP.getFreeHeap())) {
+                finalizeScan();
+                return;
+            }
             if (!initBle()) {
                 markBleUnavailable();
                 LOGE("bms", "BLE unavailable, scan aborted");
-                clearScanState();
+                finalizeScan();
                 return;
             }
         }
@@ -519,67 +617,50 @@ struct Faraday::Bms::Client::Impl
         NimBLEScan* scan = NimBLEDevice::getScan();
         if (scan == nullptr) {
             LOGE("bms", "BLE scan unavailable");
-            clearScanState();
+            finalizeScan();
             return;
         }
 
+        // Replace the previous result set; this is the documented behavior.
+        owner->lock();
+        scanResultCount = 0;
+        scanCompleted = false;
+        owner->unlock();
+
+        scanCallbacks.impl = this;
+        scanOwner = this;
         scan->setActiveScan(true);
         scan->setInterval(100);
         scan->setWindow(99);
-        scan->clearResults();
+        // maxResults == 0 together with a device callback puts NimBLE in
+        // streaming mode: each device is erased right after onResult(), so the
+        // heap never accumulates the (default) up-to-255 cached entries.
+        scan->setMaxResults(0);
+        scan->setAdvertisedDeviceCallbacks(&scanCallbacks, true);
 
-        LOGI("bms", "BLE scan started (%u ms)", (unsigned)BMS_SCAN_DURATION_MS);
-        NimBLEScanResults results = scan->start(BMS_SCAN_DURATION_MS, false);
-
-        BmsScanResult found[BMS_MAX_SCAN_RESULTS];
-        uint16_t foundCount = 0;
-
-        const int total = results.getCount();
-        for (int i = 0; i < total; ++i) {
-            NimBLEAdvertisedDevice device = results.getDevice(static_cast<uint32_t>(i));
-            const std::string mac = device.getAddress().toString();
-            const std::string name = device.haveName() ? device.getName() : std::string();
-            const int rssi = device.getRSSI();
-
-            if (mac.empty()) {
-                continue;
-            }
-
-            bool merged = false;
-            for (uint16_t j = 0; j < foundCount; ++j) {
-                if (strcasecmp(found[j].mac, mac.c_str()) == 0) {
-                    if (rssi > found[j].rssi) {
-                        found[j].rssi = rssi;
-                        snprintf(found[j].name, sizeof(found[j].name), "%s", name.c_str());
-                    }
-                    merged = true;
-                    break;
-                }
-            }
-
-            if (!merged && foundCount < BMS_MAX_SCAN_RESULTS) {
-                BmsScanResult& entry = found[foundCount];
-                snprintf(entry.mac, sizeof(entry.mac), "%s", mac.c_str());
-                snprintf(entry.name, sizeof(entry.name), "%s", name.c_str());
-                entry.rssi = rssi;
-                ++foundCount;
-            }
+        // Duration is SECONDS in the NimBLE 1.4.x API.
+        LOGI("bms", "BLE scan started (%u s)", (unsigned)BMS_SCAN_DURATION_S);
+        if (!scan->start(BMS_SCAN_DURATION_S, &Impl::scanCompleteShim)) {
+            LOGE("bms", "BLE scan failed to start");
+            scan->setAdvertisedDeviceCallbacks(nullptr, false);
+            scanOwner = nullptr;
+            finalizeScan();
+            return;
         }
 
-        scan->clearResults();
+        // Non-blocking start: this task never parks inside NimBLE (so its task
+        // notifications stay ours), results stream in via onAdvertised(), and
+        // waitAbort() exits early when the config changes (e.g. saving a MAC).
+        waitAbort(BMS_SCAN_DURATION_MS + 1000, generation);
 
-        owner->lock();
-        scanResultCount = foundCount;
-        for (uint16_t i = 0; i < foundCount; ++i) {
-            scanResults[i] = found[i];
-        }
-        scanning = false;
-        ++scanGeneration;
-        owner->unlock();
-
-        LOGI("bms", "BLE scan done: %u device(s)", (unsigned)foundCount);
+        scan->stop();
+        scan->setAdvertisedDeviceCallbacks(nullptr, false);
+        scanOwner = nullptr;
+        finalizeScan();
     }
 };
+
+Faraday::Bms::Client::Impl* Faraday::Bms::Client::Impl::scanOwner = nullptr;
 
 Faraday::Bms::Client::Client() = default;
 
@@ -641,7 +722,7 @@ void Faraday::Bms::Client::run()
         unlock();
 
         if (scanRequested) {
-            impl->performScan();
+            impl->performScan(generation);
             backoff = BMS_RECONNECT_MIN_MS;
             continue;
         }
@@ -659,6 +740,11 @@ void Faraday::Bms::Client::run()
         }
 
         if (!impl->bleInitialized) {
+            // Deferred (not failed): retry with the normal reconnect backoff.
+            if (!impl->bleHeapAvailable(ESP.getFreeHeap())) {
+                impl->waitAbort(BMS_RECONNECT_MAX_MS, generation);
+                continue;
+            }
             if (!impl->initBle()) {
                 impl->markBleUnavailable();
                 impl->waitAbort(BMS_RECONNECT_MAX_MS, generation);

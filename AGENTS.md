@@ -84,8 +84,8 @@ back up or restore by itself; only `deploy` does. `HOST`, `PIO`, `WAIT_INITIAL`,
 
 Partition layout (`partitions.csv`): two app slots `0x1D0000` = 1,900,544 B (~1.81 MiB) each
 at `0x10000` / `0x1E0000`, and the LittleFS `spiffs` data slot at `0x3B0000` with size
-`0x50000` = 327,680 B (320 KiB). The current firmware is 1,502,912 B
-(~1.43 MiB / ~1.50 MB, 79.1% of an app slot); `data/` is ~164 KiB (`du -sk data`). `make` warns when `data/`
+`0x50000` = 327,680 B (320 KiB). The current firmware is 1,472,768 B
+(~1.40 MiB / ~1.47 MB, 77.5% of an app slot); `data/` is ~164 KiB (`du -sk data`). `make` warns when `data/`
 exceeds 262,144 B (80% of the 327,680 B slot) but still attempts the upload; the device
 reports the real failure.
 
@@ -206,14 +206,16 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   mode 10 s, the three setting modes 30 s, mode first reads staggered `800 * index` ms), a
   `controlBus`-guarded `ventilationRelay.update()` + `light.update()` +
   `Faraday::Automation::update()` block **outside**
-  the `modbusBus` block, run only when `relayExpPresent` (the probe result stored in a
-  flag — the relay/light/generator objects stay uninitialized when the expander is absent, so
-  the block is skipped entirely; otherwise 200 ms take, skipped on contention and retried next
-  iteration;
+  the `modbusBus` block, run only when `mqtt.isConnected()` and `relayExpPresent` (the probe
+  result stored in a flag — the relay/light/generator objects stay uninitialized when the
+  expander is absent, so the block is skipped entirely; otherwise 200 ms take, skipped on
+  contention and retried next iteration; commands queue from HTTP `setState` while the broker
+  is down and drain on reconnect;
   `Light::Relay::update()` also pumps the backing relay — never call `lightRelay.update()`
   directly; `Automation::update()` pumps the changeover facade and then both backing relays
-  in the same pass), `Faraday::Bms::update()` (copies the mutex-guarded BLE snapshot into a
-  loop-task cache and pumps the BMS sensor objects; no RS-485 or I2C access), then the
+  in the same pass), `Faraday::Bms::update(mqttUp)` (copies the mutex-guarded BLE snapshot
+  into a loop-task cache and pumps the BMS sensor objects only when the BLE link is
+  connected and MQTT is ready; no RS-485 or I2C access), then the
   electricity-status evaluation/publish
   (outside the `modbusBus` block — `getValue()` is not bus access), then
   `networkLogger.update()`. When `inited`
@@ -222,7 +224,9 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   `modbusBus` (created and initially given as one of the first `setup()` actions): `loop()`
   wraps `modbus.loop()` + the six supplier and seventeen inverter `update()` calls in a
   `xSemaphoreTake(modbusBus, 200 ms)` /
-  `xSemaphoreGive` pair and skips the whole bus-touching block on contention (sensors retry
+  `xSemaphoreGive` pair (the sensor updates are additionally gated on `mqtt.isConnected()` so
+  an offline broker cannot produce a failed-publish log storm) and skips the whole
+  bus-touching block on contention (sensors retry
   at their next interval), and the meter/modbus/anenji handlers in `src/web/handler.cpp` take the
   same semaphore through the RAII `ModbusGuard` (also 200 ms bounded).
   **Never block the loop**: no `delay()`, no long synchronous I/O; use
@@ -235,7 +239,9 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   non-empty MAC, never at idle boot. Failed connections retry with a 5 s → 60 s exponential
   backoff. A connected session reads 0x03 → 0x04 → 0xAA every 10 s and reads model 0x05 once
   per connection; three consecutive cycles without a valid frame disconnect and retry. A scan
-  disconnects the BMS, runs ~10 s, and keeps up to 20 results in RAM.
+  disconnects the BMS, runs ~10 s, and keeps up to 20 results in RAM. BLE init is additionally
+  gated on `BMS_MIN_FREE_HEAP_FOR_BLE` so the Wi-Fi fallback can never be OOM-killed by the
+  BMS domain (deferred BLE, logged, retried with the reconnect backoff).
 - `ed-*` roles (all fetched under `.pio/libdeps/faraday/`; read them before guessing APIs):
   - `ed-config` — `EDConfig::DataMgr<T>` + `StorageLittleFS<T>` (`/config.bin` = raw
     `sizeof(Config)` + little-endian CRC16 trailer), plus `ConfigFileHandler` and
@@ -430,7 +436,7 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 ## Validation convention
 
 - Firmware: `pio run -e faraday` must pass; the build uses `-Wshadow` and
-  `CORE_DEBUG_LEVEL=5` (`platformio.ini`), so keep it warning-free. There is no lint/format
+  `CORE_DEBUG_LEVEL=3` (`platformio.ini`), so keep it warning-free. There is no lint/format
   config, no test framework and no CI. BLE/Wi-Fi coexistence and the NimBLE RAM footprint are
   hardware-verified only on a real board.
 - Frontend: `cd frontend && npm run build` (`tsc --noEmit && vite build`) must pass; it writes
@@ -449,6 +455,11 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 - **Partition change = one USB flash + LittleFS wipe.** OTA cannot rewrite the partition
   table. The first USB flash (or any later table change) invalidates `/config.bin`; the
   device boots as `Faraday_<mac>` until reconfigured.
+- USB `pio run -e faraday -t upload` writes only app slot A @ 0x10000 — with the custom table
+  (no factory partition) a device that last received firmware via OTA keeps booting slot B, so
+  the USB-flashed image may never run. Symptom: successful verified USB upload + old
+  behavior/old line numbers in serial logs. Fix: OTA upload (targets the inactive slot) or
+  `esptool write_flash 0x1e0000 .pio/build/faraday/firmware.bin` for both slots.
 - `pio run -e faraday -t uploadfs` (and `pio run -e faraday_ota -t uploadfsota`) **erase the
   whole LittleFS** (`/config.bin` included). Back up first via `make backup` or
   `GET /api/config/backup`.
@@ -585,14 +596,21 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   scan → Select) and a **reboot** for MQTT/HA entities; BLE polling itself follows immediately.
   `bmsCellCount` defaults to 12 so a 12S pack on a 20S-capable BMS publishes only the real
   cells.
+- BLE + late Wi-Fi STA fallback exceeded the heap on the real board (wifi create task NO_MEM →
+  abort loop) — the BMS task now defers BLE init below the heap floor; Ethernet link flapping
+  that triggers the Wi-Fi fallback is a hardware/bench issue to resolve separately (observed:
+  link up/down cycling a few seconds after BLE activity). With BLE deferred (or disconnected)
+  the BMS sensors stay silent — `Bms::update()` pumps them only while
+  `snapshotCache.connected` is true, so there is no MQTT/HA churn and no failed-read logging
+  until a connection exists.
 - A BLE scan **disconnects the BMS** while it runs (~10 s). Scan results are RAM-only, keep up
   to 20 devices, and persist after the scan finishes; a new scan replaces them.
 - The BMS is **read-only**: Faraday never writes MOSFET/balancer commands and does not port
   the JBD authentication flow. `balancerBitmask` bit i = cell i+1 (cells 17–32 come from
   payload bytes 14–15) and the JBD current/capacity scale (0.1 vs 0.01 depending on
   MOSFET-bit7) are ported from esphome-jbd-bms and **hardware-unverified**.
-- BMS support grew the firmware by roughly 327 KB with NimBLE-Arduino; the app slot still has
-  ~398 KB of headroom at 1,502,912 B used (79.1%). OTA and USB flashing are unaffected.
+- BMS support grew the firmware by roughly 297 KB with NimBLE-Arduino; the app slot still has
+  ~428 KB of headroom at 1,472,768 B used (77.5%). OTA and USB flashing are unaffected.
 - A v5 upgrade resets `/config.bin` (pre-v5 fails CRC/size) and rejects v4 backups — re-enter
   the BMS MAC/cell count after upgrading.
 - Library APIs change: read the checked-out sources under `.pio/libdeps/faraday/<lib>/src`

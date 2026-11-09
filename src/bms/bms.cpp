@@ -172,7 +172,7 @@ namespace Faraday
             addText(Faraday::BmsTextSensor::Kind::DeviceModel);
         }
 
-        void update()
+        void update(bool mqttReady)
         {
             if (!initialized) {
                 return;
@@ -181,6 +181,13 @@ namespace Faraday
             clientInstance.copySnapshot(snapshotCache);
 
             if (!enabled) {
+                return;
+            }
+
+            // Link-storm field incident: pumping sensors with BLE deferred/disconnected
+            // floods logs/publishes that can never carry data — stay silent until connected.
+            // Offline MQTT is the same flood class (failed-publish log storm + logger realloc).
+            if (!snapshotCache.connected || !mqttReady) {
                 return;
             }
 

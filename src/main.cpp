@@ -441,31 +441,38 @@ void loop()
     // hold the binary semaphore across modbus.loop() and the sensor polls. On
     // contention (take timeout) skip the whole bus-touching block this cycle:
     // sensors retry on their next interval.
+    const bool mqttUp = mqtt.isConnected();
     if (modbusBus != nullptr && xSemaphoreTake(modbusBus, pdMS_TO_TICKS(200)) == pdTRUE) {
         modbus.loop();
-        if (supplierEnergy) supplierEnergy->update();
-        if (supplierEnergyVoltage) supplierEnergyVoltage->update();
-        if (supplierEnergyCurrent) supplierEnergyCurrent->update();
-        if (supplierEnergyPower) supplierEnergyPower->update();
-        if (supplierEnergyReactivePower) supplierEnergyReactivePower->update();
-        if (supplierEnergyFrequency) supplierEnergyFrequency->update();
-        if (anenjiMainsVoltageSensor) anenjiMainsVoltageSensor->update();
-        if (anenjiMainsCurrentSensor) anenjiMainsCurrentSensor->update();
-        if (anenjiMainsPowerSensor) anenjiMainsPowerSensor->update();
-        if (anenjiOutputVoltageSensor) anenjiOutputVoltageSensor->update();
-        if (anenjiOutputCurrentSensor) anenjiOutputCurrentSensor->update();
-        if (anenjiOutputPowerSensor) anenjiOutputPowerSensor->update();
-        if (anenjiBatteryVoltageSensor) anenjiBatteryVoltageSensor->update();
-        if (anenjiBatteryCurrentSensor) anenjiBatteryCurrentSensor->update();
-        if (anenjiBatteryPowerSensor) anenjiBatteryPowerSensor->update();
-        if (anenjiPvVoltageSensor) anenjiPvVoltageSensor->update();
-        if (anenjiPvCurrentSensor) anenjiPvCurrentSensor->update();
-        if (anenjiPvPowerSensor) anenjiPvPowerSensor->update();
-        if (anenji != nullptr) anenjiCharging.update();
-        if (anenji != nullptr) anenjiWorkModeSensor.update();
-        if (anenji != nullptr) anenjiOutputModeSensor.update();
-        if (anenji != nullptr) anenjiOutputPrioritySensor.update();
-        if (anenji != nullptr) anenjiChargePrioritySensor.update();
+        // While MQTT is down the reads have no destination; pumping them only
+        // produces failed-publish log storms (the pinned ed-utils logger's
+        // growing append reallocs and aborts on small heaps). Skip until the
+        // broker is back — values resume on the next interval tick / change.
+        if (mqttUp) {
+            if (supplierEnergy) supplierEnergy->update();
+            if (supplierEnergyVoltage) supplierEnergyVoltage->update();
+            if (supplierEnergyCurrent) supplierEnergyCurrent->update();
+            if (supplierEnergyPower) supplierEnergyPower->update();
+            if (supplierEnergyReactivePower) supplierEnergyReactivePower->update();
+            if (supplierEnergyFrequency) supplierEnergyFrequency->update();
+            if (anenjiMainsVoltageSensor) anenjiMainsVoltageSensor->update();
+            if (anenjiMainsCurrentSensor) anenjiMainsCurrentSensor->update();
+            if (anenjiMainsPowerSensor) anenjiMainsPowerSensor->update();
+            if (anenjiOutputVoltageSensor) anenjiOutputVoltageSensor->update();
+            if (anenjiOutputCurrentSensor) anenjiOutputCurrentSensor->update();
+            if (anenjiOutputPowerSensor) anenjiOutputPowerSensor->update();
+            if (anenjiBatteryVoltageSensor) anenjiBatteryVoltageSensor->update();
+            if (anenjiBatteryCurrentSensor) anenjiBatteryCurrentSensor->update();
+            if (anenjiBatteryPowerSensor) anenjiBatteryPowerSensor->update();
+            if (anenjiPvVoltageSensor) anenjiPvVoltageSensor->update();
+            if (anenjiPvCurrentSensor) anenjiPvCurrentSensor->update();
+            if (anenjiPvPowerSensor) anenjiPvPowerSensor->update();
+            if (anenji != nullptr) anenjiCharging.update();
+            if (anenji != nullptr) anenjiWorkModeSensor.update();
+            if (anenji != nullptr) anenjiOutputModeSensor.update();
+            if (anenji != nullptr) anenjiOutputPrioritySensor.update();
+            if (anenji != nullptr) anenjiChargePrioritySensor.update();
+        }
         xSemaphoreGive(modbusBus);
     }
 
@@ -474,7 +481,11 @@ void loop()
     // lightRelay; the changeover facade pumps its two backing relays in the same
     // pass. The PCF8574 is shared with the web handlers, so hold controlBus
     // across all updates; on contention skip the block this cycle (retry next).
-    if (relayExpPresent && controlBus != nullptr && xSemaphoreTake(controlBus, pdMS_TO_TICKS(200)) == pdTRUE) {
+    // While the broker is down the command queues still fill from HTTP setState
+    // (queue-only, never blocks); pumping only retries doomed publishes and
+    // produced a per-loop LOGE storm (relay heartbeat) — on reconnect the
+    // queues drain and heartbeat resumes.
+    if (mqttUp && relayExpPresent && controlBus != nullptr && xSemaphoreTake(controlBus, pdMS_TO_TICKS(200)) == pdTRUE) {
         ventilationRelay.update();
         light.update();
         Faraday::Automation::update();
@@ -483,8 +494,9 @@ void loop()
 
     // BLE/BMS work: no RS-485 or I2C access, so its own block outside both
     // guards. The BLE task owns the radio; this only pumps the RAM-backed
-    // sensor objects.
-    Faraday::Bms::update();
+    // sensor objects. BLE-connected but MQTT-offline is the same log-flood
+    // class as the RS-485 sensors, so skip the pump until the broker is back.
+    Faraday::Bms::update(mqttUp);
 
     // Cheap, no bus access: derive the electricity state from the last valid
     // L1 voltage reading and publish it retained on change. getValue() only

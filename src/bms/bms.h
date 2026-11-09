@@ -26,8 +26,10 @@ namespace Faraday
         void init(EDMQTT::MQTT* mqtt, EDHA::DiscoveryMgr* discoveryMgr, EDHA::Device* device, const std::string& mqttPrefix);
 
         // Pumps every created sensor object. Must be called from the loop task
-        // outside the modbusBus/controlBus guards.
-        void update();
+        // outside the modbusBus/controlBus guards. Sensors are pumped only when
+        // the BLE link is connected AND MQTT is ready: publishing while offline
+        // only feeds the ed-utils logger's failed-publish flood.
+        void update(bool mqttReady);
 
         // Always-available client accessor (BLE scan, state) for the HTTP layer.
         Client* client();

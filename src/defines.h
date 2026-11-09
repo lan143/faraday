@@ -59,9 +59,17 @@
 #define BMS_RESPONSE_TIMEOUT_MS 2500
 #define BMS_RECONNECT_MIN_MS 5000
 #define BMS_RECONNECT_MAX_MS 60000
+// NimBLE 1.4.x scan start() takes the duration in SECONDS, not milliseconds.
+#define BMS_SCAN_DURATION_S 10
+// Task-side hard deadline for the scan wait (milliseconds). Kept in ms so the
+// waitAbort() math stays uniform with the other BMS timers.
 #define BMS_SCAN_DURATION_MS 10000
 #define BMS_MAX_SCAN_RESULTS 20
 #define BMS_TASK_STACK 8192
+// Floor that leaves room for the late Wi-Fi STA fallback driver (~55-60 KB
+// dynamic) plus app buffers. Measured on the field board, where late Wi-Fi
+// init aborted (ESP_ERR_NO_MEM) with the NimBLE stack already loaded.
+#define BMS_MIN_FREE_HEAP_FOR_BLE 120000
 
 // Buzzer
 #define BUZZER_PIN 2
