@@ -385,10 +385,13 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 - Relays are **ALL OFF after every boot/reboot**: `relayExp.begin()` writes `0xFF` to the
   bank before any other write, and relay state is intentionally not persisted (no `Config`
   fields added, `CURRENT_VERSION` stays 3) — there is no startup-state persistence by design.
-- The K3 → channel 2 (ventilation) / K4 → channel 3 (light) mapping and the active-low
-  ON = `LOW` follow the KC868-A8S assumption and are **hardware-unverified**; the channel
+- The reverse-order mapping K3 → channel 5 (ventilation) / K4 → channel 4 (light) is
+  **hardware-verified** (forward mapping 2/3 was observed firing relays K6/K5; the PCF8574
+  drives the bank reversed: board relay K_n = channel 8−n, remaining channels inferred from
+  that formula, not individually verified); the active-low ON = `LOW` polarity is confirmed
+  working (relay fires) and stays hardcoded in `EDCommon::Relay::PCF8574P`; the channel
   numbers live only in `src/defines.h` (`VENTILATION_RELAY_CHANNEL`, `LIGHT_RELAY_CHANNEL`) —
-  change them there only (the active-low polarity is hardcoded in `EDCommon::Relay::PCF8574P`).
+  change them there only.
 - I2C expander access is serialized by `controlBus` (200 ms bounded) between the loop task and
   the web handlers: a contended `GET`/`POST /api/controls` readback returns `null` values, not
   an error (the `POST` command itself still applies — `setState()` only enqueues).

@@ -17,11 +17,12 @@
 #define RELAY_IIC_ADDRESS 0x24   // PCF8574 output expander (relays)
 #define INPUT_IIC_ADDRESS 0x22   // PCF8574 input expander (no domain logic attached yet)
 
-// KC868-A8S relay bank on the PCF8574 @ RELAY_IIC_ADDRESS, 0-based channels.
-// Board relay K3 (1-based #3) = ventilation, K4 (#4) = light. The mapping is
-// hardware-unverified; change it here only.
-#define VENTILATION_RELAY_CHANNEL 2
-#define LIGHT_RELAY_CHANNEL 3
+// The PCF8574 @ RELAY_IIC_ADDRESS drives the KC868-A8S relay bank in REVERSE
+// board order — board relay K_n = channel (8 - n); formula verified on hardware
+// for K3→5 (ventilation) and K4→4 (light) after the original forward assumption
+// (2/3) was observed firing K6/K5; change channel numbers here only.
+#define VENTILATION_RELAY_CHANNEL 5 // board relay K3
+#define LIGHT_RELAY_CHANNEL 4       // board relay K4
 
 // Shared sensor/LED connector (one device at a time: DS18B20 / DHT11 / DHT21 / LED strip #2)
 #define SENSOR_BUS_PIN 14
