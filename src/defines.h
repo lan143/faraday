@@ -66,10 +66,13 @@
 #define BMS_SCAN_DURATION_MS 10000
 #define BMS_MAX_SCAN_RESULTS 20
 #define BMS_TASK_STACK 8192
-// Floor that leaves room for the late Wi-Fi STA fallback driver (~55-60 KB
-// dynamic) plus app buffers. Measured on the field board, where late Wi-Fi
-// init aborted (ESP_ERR_NO_MEM) with the NimBLE stack already loaded.
-#define BMS_MIN_FREE_HEAP_FOR_BLE 120000
+// Floor for the late Wi-Fi STA fallback driver plus app buffers. 120000 was
+// unreachable on the real app (measured ~75 KB free after setup()); NimBLE init
+// consumes less generic heap than the old gate assumed (classic-BT release +
+// static BTDM reservation inside the library), so 60000 leaves ~15 KB margin at
+// the boot attempt. The real BLE-up delta is measured on hardware by the
+// existing "BLE up, heap" log in src/bms/bms_client.cpp.
+#define BMS_MIN_FREE_HEAP_FOR_BLE 60000
 
 // Buzzer
 #define BUZZER_PIN 2

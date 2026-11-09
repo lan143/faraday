@@ -241,8 +241,12 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   backoff. A connected session reads 0x03 → 0x04 → 0xAA every 10 s and reads model 0x05 once
   per connection; three consecutive cycles without a valid frame disconnect and retry. A scan
   disconnects the BMS, runs ~10 s, and keeps up to 20 results in RAM. BLE init is additionally
-  gated on `BMS_MIN_FREE_HEAP_FOR_BLE` so the Wi-Fi fallback can never be OOM-killed by the
-  BMS domain (deferred BLE, logged, retried with the reconnect backoff).
+  gated on `BMS_MIN_FREE_HEAP_FOR_BLE` (now 60000) so the Wi-Fi fallback can never be
+  OOM-killed by the BMS domain (deferred BLE, logged, retried with the reconnect backoff);
+  the floor was lowered from 120000 because the app never reaches that much free heap after
+  `setup()` (~75 KB measured on hardware), and the real BLE-up heap delta is logged
+  ("BLE up, heap X->Y"). `platformio.ini` also pins
+  `-D CONFIG_ASYNC_TCP_STACK_SIZE=8192` (16→8 KiB) to reclaim heap for BLE.
 - `ed-*` roles (all fetched under `.pio/libdeps/faraday/`; read them before guessing APIs):
   - `ed-config` — `EDConfig::DataMgr<T>` + `StorageLittleFS<T>` (`/config.bin` = raw
     `sizeof(Config)` + little-endian CRC16 trailer), plus `ConfigFileHandler` and
@@ -598,10 +602,17 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   `bmsCellCount` defaults to 12 so a 12S pack on a 20S-capable BMS publishes only the real
   cells.
 - BLE + late Wi-Fi STA fallback exceeded the heap on the real board (wifi create task NO_MEM →
-  abort loop) — the BMS task now defers BLE init below the heap floor; Ethernet link flapping
-  that triggers the Wi-Fi fallback is a hardware/bench issue to resolve separately (observed:
-  link up/down cycling a few seconds after BLE activity). With BLE deferred (or disconnected)
-  the BMS sensors stay silent — `Bms::update()` pumps them only while
+  abort loop) — the BMS task now defers BLE init below the heap floor. The floor was lowered
+  from 120000 to 60000 because the app never reaches the old value after `setup()` (~75 KB
+  measured on hardware); the real BLE-up heap delta is logged ("BLE up, heap X->Y"): hardware
+  validation passed (init measured 83200->26168 B, ~48 KB free while connected and
+  polling; scan takes the full ~10 s and finds devices, direct-MAC connect and 10 s
+  telemetry polling verified over UART). If BLE + Wi-Fi fallback coexistence
+  still exceeds the heap on link flaps, raise this floor or reclaim more (the NetworkLogger
+  2×16 KiB reserve in pinned ed-utils 0.2.0 is the largest fixed consumer). Ethernet link
+  flapping that triggers the Wi-Fi fallback is a hardware/bench issue to resolve separately
+  (observed: link up/down cycling a few seconds after BLE activity). With BLE deferred (or
+  disconnected) the BMS sensors stay silent — `Bms::update()` pumps them only while
   `snapshotCache.connected` is true, so there is no MQTT/HA churn and no failed-read logging
   until a connection exists.
 - **Pinned ed-utils NetworkLogger appends every esp_log line into a 16 KB
