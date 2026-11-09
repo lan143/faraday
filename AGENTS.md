@@ -157,7 +157,8 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   at file scope in `src/bms/bms.cpp`, again not in `main.cpp`; `main.cpp` only calls
   `Faraday::Bms::init()` / `Faraday::Bms::update()` and `handler.setBms()`.
 - `setup()` order: random seed → `modbusBus` + `controlBus` FreeRTOS binary semaphores
-  (create + give each, so both guards boot unlocked) → `Serial` (115200) → verbose esp_log →
+  (create + give each, so both guards boot unlocked) → `Serial` (115200) → runtime esp_log level
+  set to INFO (see the NetworkLogger gotcha) →
   LittleFS mount
   (early return on failure) → config defaults → `configMgr.load()` → network logger init →
   `Serial2.begin(config->modbusSpeed, …)` (RS-485) + `modbus.init(15)` → `Serial1` (GSM
@@ -603,6 +604,16 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   the BMS sensors stay silent — `Bms::update()` pumps them only while
   `snapshotCache.connected` is true, so there is no MQTT/HA churn and no failed-read logging
   until a connection exists.
+- **Pinned ed-utils NetworkLogger appends every esp_log line into a 16 KB
+  `std::string` even when disabled**; during offline storms the capacity-crossing realloc
+  aborts (`bad_alloc`→`std::terminate`) on small heaps. The app therefore gates sensor pumps
+  on `mqtt.isConnected()` (loop + `Bms::update`), keeps `CORE_DEBUG_LEVEL=3`, and sets the
+  runtime esp_log level to INFO (`esp_log_level_set("*", ESP_LOG_INFO)` in `setup()`) because
+  ed-utils `LOGD`/`LOGV` bypass the compile-time gate via `esp_log_write` — a boot abort was
+  reproduced at ~24 s uptime when a full MQTT publish-payload dump (ed-mqtt `mqtt.cpp:108`)
+  appended past the 16 KiB reserved capacity and the ~32 KiB realloc threw `bad_alloc`;
+  relay/light/generator pumps likewise; the proper fix belongs upstream in ed-utils (bound
+  append by remaining capacity).
 - A BLE scan **disconnects the BMS** while it runs (~10 s). Scan results are RAM-only, keep up
   to 20 devices, and persist after the scan finishes; a new scan replaces them.
 - The BMS is **read-only**: Faraday never writes MOSFET/balancer commands and does not port

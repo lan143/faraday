@@ -145,7 +145,12 @@ void setup()
 
     Serial.begin(SERIAL_SPEED);
 
-    esp_log_level_set("*", ESP_LOG_VERBOSE);
+    // Runtime esp_log level is INFO, NOT VERBOSE: ed-utils LOGD/LOGV bypass the
+    // compile-time CORE_DEBUG_LEVEL via esp_log_write and would flood
+    // EDUtils::NetworkLogger's 16 KiB std::string buffer. Publish-payload dumps
+    // (ed-mqtt mqtt.cpp:108) crossing the reserved capacity trigger a ~32 KiB
+    // append realloc, bad_alloc and abort() on a fragmented heap.
+    esp_log_level_set("*", ESP_LOG_INFO);
 
     LOGI("setup", "Faraday");
     LOGI("setup", "start");
