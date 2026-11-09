@@ -9,7 +9,7 @@
 #include "defines.h"
 
 // Bump whenever the persisted layout changes (fields reordered/renamed/retyped).
-#define CURRENT_VERSION 4
+#define CURRENT_VERSION 5
 
 #define MQTT_TOPIC_LEN 64
 
@@ -41,4 +41,12 @@ struct Config
     // the MAP12E counter at that same moment.
     float energySyncValue = 0.0f;
     float energyMeterBase = 0.0f;
+
+    // JBD BMS Bluetooth MAC address, "AA:BB:CC:DD:EE:FF". Empty = BMS disabled
+    // (mirrors the anenjiAddress = 0 convention): no BLE init, no polling and no
+    // MQTT/HA entities until a MAC is configured.
+    char bmsMacAddress[18] = {0};
+    // Real number of cells in the battery pack (this board: 12S battery on a
+    // 20S-capable BMS), valid range 1..20. Cell telemetry is capped to this.
+    uint8_t bmsCellCount = 12;
 };

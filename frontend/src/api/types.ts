@@ -128,6 +128,78 @@ export interface ControlsState {
   generator: ControlsEntity;
 }
 
+/**
+ * Cumulative JBD BMS error counters (`errorCounts` in `GET /api/bms`). The
+ * parent object is `null` until the first valid 0xAA frame.
+ */
+export interface BmsErrorCounts {
+  shortCircuit: number;
+  chargeOvercurrent: number;
+  dischargeOvercurrent: number;
+  cellOvervoltage: number;
+  cellUndervoltage: number;
+  chargeOvertemperature: number;
+  chargeUndertemperature: number;
+  dischargeOvertemperature: number;
+  dischargeUndertemperature: number;
+  batteryOvervoltage: number;
+  batteryUndervoltage: number;
+}
+
+/**
+ * GET /api/bms and POST /api/bms/settings refreshed state.
+ *
+ * `mac` is empty when the BMS is disabled (`enabled` false). Every reading is
+ * `null` until the first valid JBD frame; `cells` always has exactly
+ * `cellCount` entries so the UI never renders cells beyond the configured
+ * pack size. `temperatures` holds only the device-reported entries.
+ */
+export interface BmsState {
+  enabled: boolean;
+  bleUnavailable: boolean;
+  mac: string;
+  cellCount: number;
+  connected: boolean;
+  lastUpdateMs: number | null;
+  reportedCellCount: number | null;
+  status: string | null;
+  errors: string | null;
+  deviceModel: string | null;
+  soc: number | null;
+  totalVoltage: number | null;
+  current: number | null;
+  power: number | null;
+  capacityRemaining: number | null;
+  nominalCapacity: number | null;
+  cycles: number | null;
+  swVersion: number | null;
+  minCellVoltage: number | null;
+  maxCellVoltage: number | null;
+  avgCellVoltage: number | null;
+  deltaCellVoltage: number | null;
+  mosfetBitmask: number | null;
+  protectionBitmask: number | null;
+  /** Bit i set = cell i+1 is balancing (32-bit). */
+  balancerBitmask: number | null;
+  temperatures: number[];
+  cells: (number | null)[];
+  errorCounts: BmsErrorCounts | null;
+}
+
+/** One BLE scan hit from `GET /api/bms/scan/status`. */
+export interface BmsScanDevice {
+  mac: string;
+  name: string;
+  rssi: number;
+}
+
+/** GET /api/bms/scan/status; results persist after the scan ends. */
+export interface BmsScanStatus {
+  running: boolean;
+  generation: number;
+  devices: BmsScanDevice[];
+}
+
 /** GET /healthcheck/healty (misspelled intentionally by the firmware lib). */
 export interface HealthResponse {
   healty: boolean;

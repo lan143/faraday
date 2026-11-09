@@ -1,5 +1,7 @@
 import type {
   AnenjiReadings,
+  BmsScanStatus,
+  BmsState,
   ControlsState,
   DeviceStatus,
   EmptyObject,
@@ -77,6 +79,11 @@ export const LIMITS = {
     ctRatioMax: 65535,
     /** Supplier kWh reading must be finite and non-negative. */
     syncMin: 0,
+  },
+  bms: {
+    /** `Config::bmsCellCount`, mirrored by `BMS_MAX_CELLS` in defines.h. */
+    cellCountMin: 1,
+    cellCountMax: 20,
   },
 } as const;
 
@@ -465,4 +472,55 @@ export function saveControls(payload: {
   }
 
   return postJson<ControlsState>('/api/controls', body, EMPTY_BODY_MESSAGE);
+}
+
+/** GET /api/bms — read-only JBD BMS telemetry snapshot. */
+export function getBmsState(): Promise<ApiResult<BmsState>> {
+  return getJson<BmsState>('/api/bms', EMPTY_BODY_MESSAGE);
+}
+
+const BMS_MAC_PATTERN = /^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/;
+
+/**
+ * POST /api/bms/settings — persists the BLE MAC and real pack cell count and
+ * returns the refreshed state. An empty MAC disables the BMS. Polling follows
+ * the new values immediately; MQTT/HA entities are created only at boot, so a
+ * reboot is required for discovery. Invalid input throws client-side.
+ */
+export function postBmsSettings(payload: {
+  mac: string;
+  cellCount: number;
+}): Promise<ApiResult<BmsState>> {
+  if (typeof payload.mac !== 'string') {
+    throw new Error('MAC address is required.');
+  }
+  const mac = payload.mac.trim();
+  if (mac !== '' && !BMS_MAC_PATTERN.test(mac)) {
+    throw new Error('MAC address must look like AA:BB:CC:DD:EE:FF.');
+  }
+  if (
+    !Number.isInteger(payload.cellCount) ||
+    payload.cellCount < LIMITS.bms.cellCountMin ||
+    payload.cellCount > LIMITS.bms.cellCountMax
+  ) {
+    throw new Error(
+      `Cell count must be an integer between ${LIMITS.bms.cellCountMin} and ${LIMITS.bms.cellCountMax}.`,
+    );
+  }
+
+  return postJson<BmsState>(
+    '/api/bms/settings',
+    { mac, cellCount: payload.cellCount },
+    EMPTY_BODY_MESSAGE,
+  );
+}
+
+/** POST /api/bms/scan/start — starts the ~10 s BLE scan on the device. */
+export function postBmsScanStart(): Promise<ActionResult> {
+  return send('/api/bms/scan/start', { method: 'POST' });
+}
+
+/** GET /api/bms/scan/status — scan progress and the latest results. */
+export function getBmsScanStatus(): Promise<ApiResult<BmsScanStatus>> {
+  return getJson<BmsScanStatus>('/api/bms/scan/status', EMPTY_BODY_MESSAGE);
 }

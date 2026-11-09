@@ -9,8 +9,12 @@
 #include <light/light.h>
 #include <sensor/anenji_mode_sensor.h>
 #include <wirenboard.h>
+#include <algorithm>
 #include <cstring>
 #include <string.h>
+#include "bms/bms.h"
+#include "bms/bms_client.h"
+#include "bms/bms_protocol.h"
 #include "defines.h"
 #include "handler.h"
 #include "web/reboot_after_response.h"
@@ -119,6 +123,7 @@ void Handler::init()
     registerMeterSettingsHandlers();
     registerAnenjiSettingsHandlers();
     registerControlHandlers();
+    registerBmsHandlers();
 
     _networkApi->registerRoutes(*_server);
 
@@ -409,6 +414,11 @@ void Handler::setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::
     _ventilationRelay = ventilation;
     _light = light;
     _generatorSwitch = generator;
+}
+
+void Handler::setBms(Faraday::Bms::Client* client)
+{
+    _bms = client;
 }
 
 void Handler::sendModbusSettingsState(AsyncWebServerRequest* request, int status)
@@ -1055,4 +1065,281 @@ void Handler::registerControlHandlers()
     postHandler->setMethod(HTTP_POST);
     postHandler->setMaxContentLength(1024);
     _server->addHandler(postHandler);
+}
+
+// Response contract: {enabled, bleUnavailable, mac, cellCount, connected,
+// lastUpdateMs, reportedCellCount, status, errors, deviceModel, soc,
+// totalVoltage, current, power, capacityRemaining, nominalCapacity, cycles,
+// swVersion, mosfetBitmask, protectionBitmask, balancerBitmask,
+// minCellVoltage, maxCellVoltage, avgCellVoltage, deltaCellVoltage,
+// temperatures, cells, errorCounts}. All fields come from one snapshot copy.
+void Handler::sendBmsState(AsyncWebServerRequest* request, int status)
+{
+    char mac[18] = {0};
+    bool hasAddress = false;
+    uint8_t configuredCells = 0;
+    bool bleUnavailable = false;
+    Faraday::Bms::BmsSnapshot snapshot;
+
+    if (_bms != nullptr) {
+        hasAddress = _bms->address(mac, sizeof(mac));
+        configuredCells = _bms->cellCount();
+        bleUnavailable = hasAddress && _bms->bleUnavailable();
+        _bms->copySnapshot(snapshot);
+    }
+
+    const bool enabled = _bms != nullptr && hasAddress;
+    const bool hasBasic = snapshot.hasBasicInfo;
+    const bool hasCellStats = hasBasic && snapshot.hasCells && snapshot.cells.count > 0;
+    const Faraday::Bms::BmsBasicInfo& basic = snapshot.basicInfo;
+
+    char statusBuf[128] = {0};
+    char errorsBuf[128] = {0};
+    if (hasBasic) {
+        Faraday::Bms::Protocol::formatOperationLabels(basic.mosfetBitmask, statusBuf, sizeof(statusBuf));
+        Faraday::Bms::Protocol::formatProtectionLabels(basic.protectionBitmask, errorsBuf, sizeof(errorsBuf));
+    }
+
+    AsyncResponseStream* response = request->beginResponseStream("application/json");
+    response->setCode(status);
+
+    std::string payload = EDUtils::buildJson([&](JsonObject entity) {
+        entity["enabled"] = enabled;
+        entity["bleUnavailable"] = bleUnavailable;
+
+        if (hasAddress) {
+            entity["mac"] = mac;
+        } else {
+            entity["mac"] = "";
+        }
+
+        entity["cellCount"] = configuredCells;
+        entity["connected"] = snapshot.connected;
+
+        if (hasBasic) {
+            entity["lastUpdateMs"] = snapshot.lastBasicInfoAtMs;
+            entity["reportedCellCount"] = basic.reportedCellCount;
+        } else {
+            entity["lastUpdateMs"] = nullptr;
+            entity["reportedCellCount"] = nullptr;
+        }
+
+        if (hasBasic) {
+            entity["status"] = statusBuf;
+            entity["errors"] = errorsBuf;
+        } else {
+            entity["status"] = nullptr;
+            entity["errors"] = nullptr;
+        }
+
+        if (snapshot.hasDeviceModel) {
+            entity["deviceModel"] = snapshot.deviceModel;
+        } else {
+            entity["deviceModel"] = nullptr;
+        }
+
+        auto putFloat = [&entity](const char* key, bool valid, float value) {
+            if (valid) {
+                entity[key] = value;
+            } else {
+                entity[key] = nullptr;
+            }
+        };
+
+        putFloat("soc", hasBasic, basic.soc);
+        putFloat("totalVoltage", hasBasic, basic.totalVoltage);
+        putFloat("current", hasBasic, basic.current);
+        putFloat("power", hasBasic, basic.power);
+        putFloat("capacityRemaining", hasBasic, basic.capacityRemaining);
+        putFloat("nominalCapacity", hasBasic, basic.nominalCapacity);
+
+        if (hasBasic) {
+            entity["cycles"] = basic.cycles;
+        } else {
+            entity["cycles"] = nullptr;
+        }
+
+        putFloat("swVersion", hasBasic, basic.swVersion);
+
+        if (hasBasic) {
+            entity["mosfetBitmask"] = basic.mosfetBitmask;
+            entity["protectionBitmask"] = basic.protectionBitmask;
+            entity["balancerBitmask"] = basic.balancerBitmask;
+        } else {
+            entity["mosfetBitmask"] = nullptr;
+            entity["protectionBitmask"] = nullptr;
+            entity["balancerBitmask"] = nullptr;
+        }
+
+        putFloat("minCellVoltage", hasCellStats, basic.minCellVoltage);
+        putFloat("maxCellVoltage", hasCellStats, basic.maxCellVoltage);
+        putFloat("avgCellVoltage", hasCellStats, basic.avgCellVoltage);
+        putFloat("deltaCellVoltage", hasCellStats, basic.deltaCellVoltage);
+
+        JsonArray temperatures = entity["temperatures"].to<JsonArray>();
+        if (hasBasic) {
+            const uint8_t count = std::min<uint8_t>(basic.temperatureCount, 6);
+            for (uint8_t i = 0; i < count; ++i) {
+                temperatures.add(basic.temperatures[i]);
+            }
+        }
+
+        JsonArray cells = entity["cells"].to<JsonArray>();
+        for (uint8_t i = 0; i < configuredCells; ++i) {
+            if (snapshot.hasCells && i < snapshot.cells.count) {
+                cells.add(snapshot.cells.volts[i]);
+            } else {
+                cells.add(nullptr);
+            }
+        }
+
+        if (!snapshot.hasErrorCounts) {
+            entity["errorCounts"] = nullptr;
+        } else {
+            JsonObject counts = entity["errorCounts"].to<JsonObject>();
+            counts["shortCircuit"] = snapshot.errorCounts.shortCircuit;
+            counts["chargeOvercurrent"] = snapshot.errorCounts.chargeOvercurrent;
+            counts["dischargeOvercurrent"] = snapshot.errorCounts.dischargeOvercurrent;
+            counts["cellOvervoltage"] = snapshot.errorCounts.cellOvervoltage;
+            counts["cellUndervoltage"] = snapshot.errorCounts.cellUndervoltage;
+            counts["chargeOvertemperature"] = snapshot.errorCounts.chargeOvertemperature;
+            counts["chargeUndertemperature"] = snapshot.errorCounts.chargeUndertemperature;
+            counts["dischargeOvertemperature"] = snapshot.errorCounts.dischargeOvertemperature;
+            counts["dischargeUndertemperature"] = snapshot.errorCounts.dischargeUndertemperature;
+            counts["batteryOvervoltage"] = snapshot.errorCounts.batteryOvervoltage;
+            counts["batteryUndervoltage"] = snapshot.errorCounts.batteryUndervoltage;
+        }
+    });
+
+    response->write(payload.c_str());
+    request->send(response);
+}
+
+void Handler::registerBmsHandlers()
+{
+    // Longer paths first: the plain "/api/bms" matcher below is
+    // backward-compatible and would otherwise swallow these siblings (same
+    // rule as the backup/config pair).
+    _server->on("/api/bms/scan/start", HTTP_POST, [this](AsyncWebServerRequest* request) {
+        if (_bms == nullptr) {
+            request->send(500, "application/json", "{\"message\": \"bms not initialized\"}");
+            return;
+        }
+
+        if (_bms->isScanning()) {
+            request->send(422, "application/json", "{\"message\": \"scan already running\"}");
+            return;
+        }
+
+        _bms->requestScan();
+        request->send(200, "application/json", "{}");
+    });
+
+    _server->on("/api/bms/scan/status", HTTP_GET, [this](AsyncWebServerRequest* request) {
+        if (_bms == nullptr) {
+            request->send(500, "application/json", "{\"message\": \"bms not initialized\"}");
+            return;
+        }
+
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+
+        std::string payload = EDUtils::buildJson([this](JsonObject entity) {
+            entity["running"] = _bms->isScanning();
+            entity["generation"] = _bms->scanGeneration();
+
+            Faraday::Bms::BmsScanResult results[BMS_MAX_SCAN_RESULTS];
+            const uint16_t count = _bms->scanResults(results, BMS_MAX_SCAN_RESULTS);
+            JsonArray devices = entity["devices"].to<JsonArray>();
+            for (uint16_t i = 0; i < count; ++i) {
+                JsonObject device = devices.add<JsonObject>();
+                device["mac"] = results[i].mac;
+                device["name"] = results[i].name;
+                device["rssi"] = results[i].rssi;
+            }
+        });
+
+        response->write(payload.c_str());
+        request->send(response);
+    });
+
+    auto* postHandler = new AsyncCallbackJsonWebHandler(
+        "/api/bms/settings",
+        [this](AsyncWebServerRequest* request, JsonVariant& json) {
+            if (!json.is<JsonObject>()) {
+                request->send(422, "application/json", "{\"message\": \"invalid json\"}");
+                return;
+            }
+
+            if (_bms == nullptr) {
+                request->send(500, "application/json", "{\"message\": \"bms not initialized\"}");
+                return;
+            }
+
+            const JsonVariant macValue = json["mac"];
+            if (macValue.isNull()) {
+                sendFieldError(request, "mac", "required");
+                return;
+            }
+
+            if (!macValue.is<const char*>()) {
+                sendFieldError(request, "mac", "invalid value");
+                return;
+            }
+
+            const JsonVariant cellCountValue = json["cellCount"];
+            if (cellCountValue.isNull()) {
+                sendFieldError(request, "cellCount", "required");
+                return;
+            }
+
+            if (!cellCountValue.is<int>()) {
+                sendFieldError(request, "cellCount", "invalid value");
+                return;
+            }
+
+            const int cellCount = cellCountValue.as<int>();
+            if (cellCount < 1 || cellCount > BMS_MAX_CELLS) {
+                sendFieldError(request, "cellCount", "invalid value");
+                return;
+            }
+
+            // Empty MAC disables the BMS; anything else must be a full,
+            // normalizable "AA:BB:CC:DD:EE:FF" address.
+            char normalizedMac[18] = {0};
+            const char* macInput = macValue.as<const char*>();
+            if (macInput[0] != '\0'
+                && !Faraday::Bms::validateMacAddress(macInput, normalizedMac, sizeof(normalizedMac))) {
+                sendFieldError(request, "mac", "invalid value");
+                return;
+            }
+
+            Config* config = _configMgr->getData();
+            snprintf(config->bmsMacAddress, sizeof(config->bmsMacAddress), "%s", normalizedMac);
+            config->bmsCellCount = static_cast<uint8_t>(cellCount);
+
+            if (!_configMgr->store()) {
+                request->send(500, "application/json", "{\"message\": \"failed to store config\"}");
+                return;
+            }
+
+            // Live-apply so polling follows the new device immediately. MQTT/HA
+            // entities stay fixed at boot (the UI shows a reboot hint).
+            _bms->setAddress(normalizedMac[0] != '\0' ? normalizedMac : "");
+            _bms->setCellCount(static_cast<uint8_t>(cellCount));
+
+            sendBmsState(request, 200);
+        }
+    );
+    postHandler->setMethod(HTTP_POST);
+    postHandler->setMaxContentLength(1024);
+    _server->addHandler(postHandler);
+
+    _server->on("/api/bms", HTTP_GET, [this](AsyncWebServerRequest* request) {
+        if (_bms == nullptr) {
+            request->send(500, "application/json", "{\"message\": \"bms not initialized\"}");
+            return;
+        }
+
+        sendBmsState(request, 200);
+    });
 }

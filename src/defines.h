@@ -52,6 +52,17 @@
 #define GSM_TX 15
 #define GSM_SPEED 115200
 
+// JBD BMS over Bluetooth (read-only telemetry).
+#define BMS_MAX_CELLS 20
+#define BMS_DEFAULT_CELLS 12
+#define BMS_POLL_INTERVAL_MS 10000
+#define BMS_RESPONSE_TIMEOUT_MS 2500
+#define BMS_RECONNECT_MIN_MS 5000
+#define BMS_RECONNECT_MAX_MS 60000
+#define BMS_SCAN_DURATION_MS 10000
+#define BMS_MAX_SCAN_RESULTS 20
+#define BMS_TASK_STACK 8192
+
 // Buzzer
 #define BUZZER_PIN 2
 

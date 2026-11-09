@@ -30,6 +30,7 @@
 #include "defines.h"
 #include "config.h"
 #include "automation/automation.h"
+#include "bms/bms.h"
 #include "web/handler.h"
 #include "web/reboot_after_response.h"
 
@@ -375,6 +376,9 @@ void setup()
         }
     }
 
+    Faraday::Bms::init(&mqtt, &discoveryMgr, device, mqttPrefix);
+    handler.setBms(Faraday::Bms::client());
+
     if (relayExpPresent) {
         // The three relay/light inits touch the shared PCF8574 and must never be
         // skipped: block (bounded in practice by the 200 ms handler guard) until
@@ -476,6 +480,11 @@ void loop()
         Faraday::Automation::update();
         xSemaphoreGive(controlBus);
     }
+
+    // BLE/BMS work: no RS-485 or I2C access, so its own block outside both
+    // guards. The BLE task owns the radio; this only pumps the RAM-backed
+    // sensor objects.
+    Faraday::Bms::update();
 
     // Cheap, no bus access: derive the electricity state from the last valid
     // L1 voltage reading and publish it retained on change. getValue() only

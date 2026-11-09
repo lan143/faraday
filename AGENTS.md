@@ -10,9 +10,10 @@ Faraday is the **base controller skeleton** for a DIY ESP32 + LAN8720 board, mod
 yet: it boots, mounts LittleFS, persists a raw `Config` in `/config.bin`, brings up Ethernet
 (LAN8720) with Wi-Fi/AP fallback, connects to MQTT, creates one Home Assistant discovery
 device, serves a Preact panel from LittleFS, exposes healthchecks and OTA, probes two PCF8574
-expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, and emits one boot beep.
+expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, reads a JBD BMS over
+BLE, and emits one boot beep.
 
-Four domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
+Five domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
 voltage, current, active power, reactive power, frequency and a software-offset supplier
 energy counter, plus CT-ratio and supplier-sync settings; **relay control** — light and
 ventilation on the KC868-A8S relay bank through the PCF8574 output expander at `0x24`; a
@@ -21,8 +22,13 @@ expander (one HA switch, `faraday/<chip>/generator/state|set`; ON = generator, b
 energized); and optional **Anenji 4200 hybrid inverter telemetry** over the same RS-485 bus
 (12 numeric sensors + one battery-charging binary_sensor + four text-state mode/priority
 sensors — work mode, output mode, output priority, charge priority — read-only, no inverter
-control, Modbus slave address in config, disabled by default with `anenjiAddress = 0`).
-There is **no automatic** network↔generator switching yet — `src/automation/` is where that
+control, Modbus slave address in config, disabled by default with `anenjiAddress = 0`); and
+**read-only JBD BMS telemetry over BLE** (14 aggregate numeric sensors, one voltage sensor per
+configured cell, four binary sensors — charging/discharging/balancing/fault — and three
+text-state sensors — status/errors/device model). The BMS MAC is entered manually or picked
+from a built-in BLE scan, and a configurable 1–20 cell count makes a 12S pack on a
+20S-capable BMS publish only the real cells. There is no BMS control (no MOSFET/balancer
+writes, no authentication flow). There is **no automatic** network↔generator switching yet — `src/automation/` is where that
 logic will go.
 There is still **no domain logic** for inputs (expander `0x22`), GSM, RF433, LED strips,
 analog inputs, RS-485 devices other than the WB-MAP12E and the Anenji 4200, or the buzzer
@@ -48,6 +54,9 @@ The env also sets
 `lib_ignore = ESPAsyncTCP, RPAsyncTCP`: those ESP8266/Raspberry Pi TCP stacks leak in
 transitively through library manifests, and a clean dependency resolve breaks unless they are
 excluded (`AsyncTCP` is the ESP32 stack). Keep both entries when editing `lib_deps`.
+
+`lib_deps` also includes `h2zero/NimBLE-Arduino@==1.4.3` for the BMS BLE domain; the
+`lib_ignore` rule above is unchanged.
 
 OTA target and auth come from the **untracked** project-root `/.env` (copy `.env.example`):
 `FARADAY_OTA_IP` and `FARADAY_OTA_AUTH`. `scripts/ota_env.py` injects them into
@@ -75,8 +84,8 @@ back up or restore by itself; only `deploy` does. `HOST`, `PIO`, `WAIT_INITIAL`,
 
 Partition layout (`partitions.csv`): two app slots `0x1D0000` = 1,900,544 B (~1.81 MiB) each
 at `0x10000` / `0x1E0000`, and the LittleFS `spiffs` data slot at `0x3B0000` with size
-`0x50000` = 327,680 B (320 KiB). The current firmware is 1,175,472 B
-(~1.12 MiB / ~1.18 MB); `data/` is ~148 KiB (`du -sk data`). `make` warns when `data/`
+`0x50000` = 327,680 B (320 KiB). The current firmware is 1,502,912 B
+(~1.43 MiB / ~1.50 MB, 79.1% of an app slot); `data/` is ~164 KiB (`du -sk data`). `make` warns when `data/`
 exceeds 262,144 B (80% of the 327,680 B slot) but still attempts the upload; the device
 reports the real failure.
 
@@ -93,6 +102,12 @@ src/
 ├── main.cpp                 Composition root: globals, setup()/loop(), wiring
 ├── defines.h                GPIO pins, serial speeds, identity, FW version define
 ├── config.h                 Config struct persisted raw to /config.bin; CURRENT_VERSION
+├── bms/
+│   ├── bms_types.h          Plain snapshot structs shared by the BLE task, codec and sensors
+│   ├── bms_protocol.h/.cpp  Pure JBD codec: frames, CRC, split-frame assembler, label formatting
+│   ├── bms_client.h/.cpp    NimBLE client + dedicated "bms" task, snapshot mutex and BLE scan
+│   ├── bms_sensors.h/.cpp   Faraday numeric/binary/text HA sensor classes over the snapshot
+│   └── bms.h/.cpp           Facade like automation.cpp: client singleton + sensor wiring
 ├── automation/
 │   └── automation.h/.cpp    Mains/generator changeover: two MQTT-less PCF8574P backing relays + Relay-derived facade owning topics/discovery; future switching logic
 ├── sensor/
@@ -101,7 +116,7 @@ src/
 │   ├── anenji_charging_state.h/.cpp  Faraday::BatteryChargingState: HA binary_sensor from register 232 sign
 │   └── anenji_mode_sensor.h/.cpp  Faraday::AnenjiModeSensor: four plain text-state HA sensors (work/output mode, output/charge priority) + single-source `label()`
 └── web/
-    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/anenji/controls routes
+    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/anenji/bms/controls routes
     ├── backup_specs.h       BackupFileSpec table + /api/config handler configs
     └── reboot_after_response.h  Deferred reboot after the HTTP response is flushed
 frontend/                    Preact + TypeScript + Vite SPA sources (tabs incl. Modbus/Meter/Anenji); npm run build -> data/
@@ -118,8 +133,8 @@ Makefile                     OTA deploy orchestration (deploy/backup/restore/sta
 `data/` is build output from `frontend/` — edit the frontend source, not the bundle.
 `frontend/package.json` pulls the network/config/log web components from the sibling
 `ed-network`, `ed-config` and `ed-utils` packages via `file:../../…/frontend` dependencies;
-the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
-`Anenji.tsx`) are local pages.
+the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
+`Anenji.tsx`, `Bms.tsx`) are local pages.
 
 ## Architecture
 
@@ -138,6 +153,9 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   `Handler`. The mains/generator changeover objects (two `EDCommon::Relay::PCF8574P` backing
   relays over `relayExp` and a `Relay`-derived `GeneratorChangeover` facade) live at file
   scope in `src/automation/automation.cpp`, which `extern`s `relayExp` — not in `main.cpp`.
+  The BMS objects (NimBLE client, dedicated task state, snapshot cache and sensor vectors) live
+  at file scope in `src/bms/bms.cpp`, again not in `main.cpp`; `main.cpp` only calls
+  `Faraday::Bms::init()` / `Faraday::Bms::update()` and `handler.setBms()`.
 - `setup()` order: random seed → `modbusBus` + `controlBus` FreeRTOS binary semaphores
   (create + give each, so both guards boot unlocked) → `Serial` (115200) → verbose esp_log →
   LittleFS mount
@@ -162,8 +180,11 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   "Mains/Output/Battery/PV voltage/current/power") → `anenjiCharging.setDevice()` +
   `init()` (binary_sensor; disabled together with the sensors when `anenjiAddress == 0`, so
   nothing is created or wired) → four `AnenjiModeSensor` `setDevice()` + `init(..., index
-  0..3)` calls (plain text-state HA sensors; first read staggered `800 * index` ms) → a
-  `controlBus`-guarded block that runs only when `relayExpPresent`
+  0..3)` calls (plain text-state HA sensors; first read staggered `800 * index` ms) →
+  `Faraday::Bms::init(&mqtt, &discoveryMgr, device, mqttPrefix)` +
+  `handler.setBms(Faraday::Bms::client())` (starts the `"bms"` task; with an empty BMS MAC it
+  creates no sensors and the BLE stack stays dormant) → a `controlBus`-guarded block that
+  runs only when `relayExpPresent`
   (probe result stored in a flag; when absent the block and the following
   `handler.setControls()` are skipped with a `LOGW`, so the handler pointers stay nullptr)
   (`xSemaphoreTake(controlBus, portMAX_DELAY)` — **never skipped** once entered, because
@@ -191,7 +212,9 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   iteration;
   `Light::Relay::update()` also pumps the backing relay — never call `lightRelay.update()`
   directly; `Automation::update()` pumps the changeover facade and then both backing relays
-  in the same pass), the electricity-status evaluation/publish
+  in the same pass), `Faraday::Bms::update()` (copies the mutex-guarded BLE snapshot into a
+  loop-task cache and pumps the BMS sensor objects; no RS-485 or I2C access), then the
+  electricity-status evaluation/publish
   (outside the `modbusBus` block — `getValue()` is not bus access), then
   `networkLogger.update()`. When `inited`
   is false only the deferred-reboot check runs. Modbus bus access is serialized between the
@@ -205,6 +228,14 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   **Never block the loop**: no `delay()`, no long synchronous I/O; use
   `esp_timer_get_time()` for intervals. Relay/light `setState()` is queue-only and never
   needs the bus, so it is safe to call from the AsyncTCP task.
+- BMS/BLE threading: every NimBLE call runs only in the dedicated `"bms"` FreeRTOS task
+  created by `Client::start()`; the loop task and AsyncTCP handlers only take the client's
+  mutex-guarded snapshot/metadata (small plain-data copies, so no 200 ms bus-style guard is
+  needed). BLE init is lazy — the stack starts on the first scan request or the first
+  non-empty MAC, never at idle boot. Failed connections retry with a 5 s → 60 s exponential
+  backoff. A connected session reads 0x03 → 0x04 → 0xAA every 10 s and reads model 0x05 once
+  per connection; three consecutive cycles without a valid frame disconnect and retry. A scan
+  disconnects the BMS, runs ~10 s, and keeps up to 20 results in RAM.
 - `ed-*` roles (all fetched under `.pio/libdeps/faraday/`; read them before guessing APIs):
   - `ed-config` — `EDConfig::DataMgr<T>` + `StorageLittleFS<T>` (`/config.bin` = raw
     `sizeof(Config)` + little-endian CRC16 trailer), plus `ConfigFileHandler` and
@@ -218,11 +249,12 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   - `ed-utils` — `EDUtils::LogConfig`/`NetworkLogger`, `formatString`, `getMacAddress`,
     `getChipID`, `buildJson`, `LOGx` macros.
   - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and entities of five
-    kinds register on it: the WB-MAP12E and Anenji numeric sensors (unit/device class/state
-    class), the four Anenji mode sensors as plain text-state `sensor`s (state topic +
-    `{{ value }}` value template — no unit/device class/state class, `EDHA::Sensor` emits
-    those only when set), the ventilation and generator **switches**, the light **light**,
-    and the battery-charging **binary_sensor**.
+    kinds register on it: the WB-MAP12E, Anenji and BMS numeric sensors (unit/device
+    class/state class), the four Anenji mode sensors and three BMS text sensors as plain
+    text-state `sensor`s (state topic + `{{ value }}` value template — no unit/device
+    class/state class, `EDHA::Sensor` emits those only when set), the ventilation and
+    generator **switches**, the light **light**, and the battery-charging/BMS
+    **binary_sensors**.
   - `ed-healthcheck` — `Ready` interface + `HealthCheck`; only `mqtt` is registered.
   - `ed-wb` — `EDWB::WirenBoard` (Modbus RTU client over `Stream`) + device drivers; Faraday
     uses `MAP12E` (`getVoltage`/`getCurrent`/`getActivePower`/`getReactivePower`/
@@ -240,12 +272,15 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
     is hardcoded in it) and `EDCommon::Light::Relay` (light facade over a backing relay):
     their `init()` auto-subscribes the MQTT command topic and registers the HA switch/light
     entity when given MQTT/discovery options.
+  - `NimBLE-Arduino` — BLE stack used only by `src/bms/` (JBD client, characteristic
+    notifications, scan); no BLE calls run outside the `"bms"` task.
   - `ESPAsyncWebServer` — port 80, no authentication.
-- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 4`) holds network, MQTT,
-  HA-discovery flag/prefix, command/state/status topics, log settings, and the
+- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 5`) holds network, MQTT,
+  HA-discovery flag/prefix, command/state/status topics, log settings, the
   Modbus/WB-MAP12E/Anenji fields (`modbusSpeed` default 9600, `map12eAddress` default 1,
   `map12eCt1Ratio` default 0, `anenjiAddress` default 0 = inverter disabled,
-  `energySyncValue`, `energyMeterBase`). The MQTT portion is exposed at `GET /api/settings` and
+  `energySyncValue`, `energyMeterBase`) and the BMS fields (`bmsMacAddress`, default `""` =
+  disabled, and `bmsCellCount`, default 12, valid 1..20). The MQTT portion is exposed at `GET /api/settings` and
   written by `POST /api/settings/mqtt`, which mutates the in-RAM `Config` and calls
   `configMgr.store()`; the Modbus and meter sections have their own JSON endpoints. The whole
   struct is persisted raw to `/config.bin` by `EDConfig::DataMgr<Config>`/`StorageLittleFS`
@@ -257,10 +292,12 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   persisted immediately by their handlers; MQTT changes take effect after a reboot, network
   and log settings apply live, Modbus speed applies live (device register write on the old
   baud, then local `Serial2.begin`), the MAP12E and Anenji addresses apply after a reboot,
-  and meter CT-ratio/sync writes hit the device before being stored. There is **no migration
-  layer**: a layout change requires bumping `CURRENT_VERSION`, so a pre-v4 `/config.bin`
-  fails the CRC/size check and is silently replaced by defaults, and pre-v4 backups are
-  rejected on restore.
+  and meter CT-ratio/sync writes hit the device before being stored. BMS MAC/cell count apply
+  live to BLE polling after `POST /api/bms/settings`, but BMS MQTT/HA entities (including the
+  number of cell entities) are created only at boot, so a reboot is required for discovery
+  changes. There is **no migration layer**: a layout change requires bumping
+  `CURRENT_VERSION`, so a pre-v5 `/config.bin` fails the CRC/size check and is silently
+  replaced by defaults, and pre-v5 backups are rejected on restore.
 - Backup specs currently contain only `config.bin`; append future domain state files to
   `BackupSpecs::kBackupFiles` (and bump the archive cap only with a reason — the library
   default is 16 KiB).
@@ -313,7 +350,18 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   published on change with a 60 s retained heartbeat, a failed read holds the last label,
   failed publishes stay pending and are retried, and nothing is published before the first
   valid read. Work mode (register 201) is polled every 10 s, the three setting registers
-  (output mode 300, output priority 301, charge priority 331) every 30 s.
+  (output mode 300, output priority 301, charge priority 331) every 30 s. When a BMS MAC is
+  configured at boot, the BMS domain registers 14 numeric `measurement`-class sensors on
+  `faraday/<chip>/bms_{state_of_charge,total_voltage,current,power,capacity_remaining,
+  nominal_capacity,charging_cycles,min_cell_voltage,max_cell_voltage,avg_cell_voltage,
+  delta_cell_voltage,temperature_1,temperature_2,temperature_3}/state` (Ah counters and the
+  cycle count are plain `measurement`; voltage precision 2–3, current 2, power 1), one
+  `faraday/<chip>/bms_cell_<n>_voltage/state` per configured cell (precision 3, only 1..
+  `bmsCellCount`), four retained `ON`/`OFF` binary_sensors `bms_charging` / `bms_discharging`
+  / `bms_balancing` / `bms_fault` (publish on change + 60 s heartbeat, silent before the first
+  valid frame, hold the last value on a failed read), and three plain text-state sensors
+  `bms_status` / `bms_errors` / `bms_device_model` (same publish conventions). With an empty
+  MAC the domain creates zero BMS topics and entities.
 - Electricity status: an `ElectricityStatus` enum (`OK`, `ON_BATTERY`; `ON_GENERATOR`/`FAIL`
   reserved for future generator/inverter logic and never entered) is derived from the L1
   voltage sensor with hysteresis — `OK` → `ON_BATTERY` at ≤0 V, `ON_BATTERY` → `OK` at >100 V,
@@ -332,10 +380,10 @@ ESPAsyncWebServer on port 80, **no authentication** (LAN-only device). Static fi
 served from LittleFS root at `/` with `index.html`; `/config.bin` is also exposed as a static
 file in addition to the `/api/config` download route. JSON responses use `application/json`.
 Mutating config handlers reply `200 {}` on success, `422 {"message": …}` on validation error
-and `500 {"message": …}` on storage failure unless noted; the Modbus, meter and controls
-handlers are the exception — they reply `200` with the refreshed state. Those three endpoints
-(like `/api/log/settings`) take JSON bodies; `/api/settings/mqtt` is urlencoded and the
-config/backup routes take raw bodies.
+and `500 {"message": …}` on storage failure unless noted; the Modbus, meter, BMS-settings
+and controls handlers are the exception — they reply `200` with the refreshed state. Those
+endpoints (like `/api/log/settings`) take JSON bodies; `/api/settings/mqtt` is urlencoded and
+the config/backup routes take raw bodies.
 
 | Route | Method | Notes |
 |---|---|---|
@@ -360,6 +408,10 @@ config/backup routes take raw bodies.
 | `/api/settings/meter` | GET | JSON `{ct1Ratio, energySyncValue, energyMeterBase, meterEnergy, supplierEnergy}`; the two live readings are `null` while the meter is unreachable or the bus guard times out (still 200) |
 | `/api/settings/meter` | POST | JSON (max 1024 B), at least one of `ct1Ratio` (0–65535) / `energySyncValue` (≥0); device CT write and/or energy read happen **before** store, so 500 `{"message":"meter unreachable"}` aborts without persisting (a bus-guard timeout takes the same path); 422 field errors; 200 returns the refreshed state |
 | `/api/settings/anenji` | GET | Always 200 `{enabled, mainsVoltage, mainsCurrent, mainsPower, outputVoltage, outputCurrent, outputPower, batteryVoltage, batteryCurrent, batteryPower, batteryCharging, pvVoltage, pvCurrent, pvPower, workMode, outputMode, outputPriority, chargePriority}`; every reading is `null` when the inverter is disabled (`anenjiAddress == 0` or `setAnenji()` never wired), the 200 ms `modbusBus` guard times out, or the fast-fail probe fails (a failed first `getMainsVoltage` read skips the remaining 15 reads); on the reachable path each field is `null` iff its own read failed; `batteryCharging` is `bool\|null` from the register 232 sign (0/failed → `null`); the four mode fields are `string\|null` labels from `AnenjiModeSensor::label` (`"Unknown"` for unmapped enum values) with the same null semantics as the other readings; read-only — no POST on this route |
+| `/api/bms` | GET | Always 200 when wired: `{enabled, bleUnavailable, mac, cellCount, connected, lastUpdateMs, reportedCellCount, status, errors, deviceModel, soc, totalVoltage, current, power, capacityRemaining, nominalCapacity, cycles, swVersion, mosfetBitmask, protectionBitmask, balancerBitmask, temperatures, cells, errorCounts}`; `mac` is `""` when unset; every reading is `null` until the first valid JBD frame; `cells` has exactly `cellCount` entries; `errorCounts` is `null` or 11 integer keys; 500 `{"message":"bms not initialized"}` before `handler.setBms()` wiring |
+| `/api/bms/settings` | POST | JSON (max 1024 B), both `mac` (empty disables; otherwise normalized `AA:BB:CC:DD:EE:FF`) and `cellCount` (1..20) required; 422 `{"message":"<field>: required\|invalid value"}`, 500 `{"message":"failed to store config"\|"bms not initialized"}`, 200 returns the full refreshed BMS state; MAC/cell count apply live to BLE polling, MQTT/HA discovery changes need a reboot |
+| `/api/bms/scan/start` | POST | Starts the ~10 s BLE scan; 200 `{}`, 422 `{"message":"scan already running"}`, 500 `{"message":"bms not initialized"}`; disconnects the BMS while scanning |
+| `/api/bms/scan/status` | GET | 200 `{running, generation, devices:[{mac,name,rssi}]}`; results persist after the scan ends (RAM-only, max 20); 500 `{"message":"bms not initialized"}` |
 | `/api/controls` | GET | JSON `{"ventilation":{"enabled":bool\|null},"light":{"enabled":bool\|null},"generator":{"enabled":bool\|null}}`; a field is `null` when the live readback is unavailable because the 200 ms `controlBus` guard timed out (meter-null convention, still 200); 500 `{"message":"controls not initialized"}` before `handler.setControls()` wiring |
 | `/api/controls` | POST | JSON (max 1024 B), at least one of `ventilation`/`light`/`generator` (booleans): none → 422 `{"message":"ventilation or light or generator: required"}`, non-bool → 422 `{"message":"<field>: invalid value"}`; `setState()` only enqueues (never needs the bus), 200 echoes the requested values for touched fields while untouched fields are a readback or `null` on guard timeout; `500 {"message":"controls busy"}` if a command enqueue fails (full internal queue — rare); no config store, no reboot |
 | `/healthcheck/healty` | GET | Always 200 `{"healty":true}` (the typo is the ed-healthcheck API) |
@@ -368,8 +420,10 @@ config/backup routes take raw bodies.
 Route registration order matters: `/api/config/backup` is registered before `/api/config`
 because the shorter matcher is backward-compatible and would otherwise swallow it. Likewise
 `/api/settings/modbus`, `/api/settings/meter` and `/api/settings/anenji` are registered before
-the plain `/api/settings` matcher. `/api/controls` is a distinct prefix with no matcher-order
-interaction with `/api/settings`, so it has no ordering constraint. Reboots are deferred
+the plain `/api/settings` matcher, and `/api/bms/scan/start`, `/api/bms/scan/status` and
+`/api/bms/settings` before the plain `/api/bms` matcher (`registerBmsHandlers()` sits between
+the controls and `networkApi` registration). `/api/controls` is a distinct prefix with no
+matcher-order interaction with `/api/settings`, so it has no ordering constraint. Reboots are deferred
 through `RebootAfterResponse` so the response
 reaches the client; do not call `ESP.restart()` directly from a handler.
 
@@ -377,7 +431,8 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 
 - Firmware: `pio run -e faraday` must pass; the build uses `-Wshadow` and
   `CORE_DEBUG_LEVEL=5` (`platformio.ini`), so keep it warning-free. There is no lint/format
-  config, no test framework and no CI.
+  config, no test framework and no CI. BLE/Wi-Fi coexistence and the NimBLE RAM footprint are
+  hardware-verified only on a real board.
 - Frontend: `cd frontend && npm run build` (`tsc --noEmit && vite build`) must pass; it writes
   into `data/` with `emptyOutDir: true`.
 - Hardware-dependent and **not verifiable locally**: OTA/espota, partition-table migration,
@@ -439,12 +494,12 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   warning) the device-side write is skipped but `Serial2` still switches to the persisted
   speed; nothing rewrites the meter's speed register at boot, so the device side stays at the
   old baud until the speed write is re-applied.
-- `CURRENT_VERSION` is 4 with **no migration layer**: a pre-v4 `/config.bin` fails the
-  CRC/size check and is silently replaced by defaults, and pre-v4 (v3) backups are rejected
+- `CURRENT_VERSION` is 5 with **no migration layer**: a pre-v5 `/config.bin` fails the
+  CRC/size check and is silently replaced by defaults, and pre-v5 (v4) backups are rejected
   on restore (member size check, with the version byte as a second guard).
-- v4 rejects v3 backups by design: an upgrade effectively resets the config — a pre-v4
-  `/config.bin` fails the CRC/size check and falls back to defaults, and restoring a v3
-  backup is refused; reconfigure (or re-enter settings) after upgrading.
+- v5 rejects v4 backups by design: an upgrade effectively resets the config — a pre-v5
+  `/config.bin` fails the CRC/size check and falls back to defaults, and restoring a v4
+  backup is refused; re-enter all settings (including the BMS MAC/cell count) after upgrading.
 - `anenjiAddress` defaults to 0 (inverter disabled): enabling requires saving a non-zero
   address (1–247) on the Modbus tab **and a reboot**; while disabled no bus device, MQTT
   topics or HA entities exist, loop updates never touch the RS-485 device, and
@@ -464,8 +519,8 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   `state_class`).
 - The Anenji mode/priority fields are **read-only**: Faraday never writes the inverter's
   setting registers (ed-wb's `setOutputMode`/`setOutputPriority`/`setBatteryChargePriority`
-  are not wired) — change priorities on the inverter panel. This feature adds no `Config`
-  field: `CURRENT_VERSION` stays 4, so no config reset.
+  are not wired) — change priorities on the inverter panel. This Anenji feature adds no
+  `Config` field of its own; the current `CURRENT_VERSION` is 5 because of the BMS fields.
 - After a config reset the Modbus defaults are already usable (meter address 1, inverter
   disabled at 0), so no address edit is required for the meter — but a previously enabled
   inverter must be re-enabled (`anenjiAddress` set + reboot) after a `/config.bin` wipe.
@@ -499,8 +554,8 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   input expander `0x22` still has no domain logic attached.
 - Relays are **ALL OFF after every boot/reboot**: `relayExp.begin()` writes `0xFF` to the
   bank before any other write, and relay state is intentionally not persisted (no relay
-  `Config` fields — `CURRENT_VERSION` is 4 only because of `anenjiAddress`) — there is no
-  startup-state persistence by design.
+  `Config` fields — `CURRENT_VERSION` is 5 because of the BMS fields, and 4 was only because
+  of `anenjiAddress`) — there is no startup-state persistence by design.
 - The reverse-order mapping K3 → channel 5 (ventilation) / K4 → channel 4 (light) is
   **hardware-verified** (forward mapping 2/3 was observed firing relays K6/K5; the PCF8574
   drives the bank reversed: board relay K_n = channel 8−n, remaining channels inferred from
@@ -524,6 +579,22 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   early if either key is missing. Never put real credentials in the repo.
 - The default log endpoint (`192.168.1.2:5555/_bulk`) is a placeholder; change it in the Log
   tab. Logging is enabled only while the network is connected and flushes every 10 s.
+- **BLE shares the 2.4 GHz radio with Wi-Fi on the classic ESP32.** The Ethernet/LAN8720 path
+  is theoretically unaffected, but Wi-Fi + BLE coexistence and the NimBLE RAM footprint are
+  **hardware-unverified**. Enabling the BMS requires setting `bmsMacAddress` on the BMS tab (or
+  scan → Select) and a **reboot** for MQTT/HA entities; BLE polling itself follows immediately.
+  `bmsCellCount` defaults to 12 so a 12S pack on a 20S-capable BMS publishes only the real
+  cells.
+- A BLE scan **disconnects the BMS** while it runs (~10 s). Scan results are RAM-only, keep up
+  to 20 devices, and persist after the scan finishes; a new scan replaces them.
+- The BMS is **read-only**: Faraday never writes MOSFET/balancer commands and does not port
+  the JBD authentication flow. `balancerBitmask` bit i = cell i+1 (cells 17–32 come from
+  payload bytes 14–15) and the JBD current/capacity scale (0.1 vs 0.01 depending on
+  MOSFET-bit7) are ported from esphome-jbd-bms and **hardware-unverified**.
+- BMS support grew the firmware by roughly 327 KB with NimBLE-Arduino; the app slot still has
+  ~398 KB of headroom at 1,502,912 B used (79.1%). OTA and USB flashing are unaffected.
+- A v5 upgrade resets `/config.bin` (pre-v5 fails CRC/size) and rejects v4 backups — re-enter
+  the BMS MAC/cell count after upgrading.
 - Library APIs change: read the checked-out sources under `.pio/libdeps/faraday/<lib>/src`
   instead of guessing. `data/` is generated; do not edit it by hand.
 
