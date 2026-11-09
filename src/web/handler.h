@@ -53,7 +53,7 @@ public:
 
     void init();
     void setMap12E(EDWB::MAP12E* map12e);
-    void setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light);
+    void setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light, EDCommon::Relay::Relay* generator);
 
 private:
     void registerLogSettingsHandlers();
@@ -68,7 +68,8 @@ private:
         AsyncWebServerRequest* request,
         int status,
         std::pair<bool, bool> ventilation,
-        std::pair<bool, bool> light
+        std::pair<bool, bool> light,
+        std::pair<bool, bool> generator
     );
 
     AsyncWebServer* _server = nullptr;
@@ -79,6 +80,7 @@ private:
     EDWB::MAP12E* _map12e = nullptr;
     EDCommon::Relay::Relay* _ventilationRelay = nullptr;
     EDCommon::Light::Light* _light = nullptr;
+    EDCommon::Relay::Relay* _generatorSwitch = nullptr;
     EDConfig::ConfigFileHandler _configFileHandler;
     EDConfig::ConfigBackupHandler _configBackupHandler;
 };

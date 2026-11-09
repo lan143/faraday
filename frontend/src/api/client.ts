@@ -409,8 +409,9 @@ export function getControls(): Promise<ApiResult<ControlsState>> {
 export function saveControls(payload: {
   ventilation?: boolean;
   light?: boolean;
+  generator?: boolean;
 }): Promise<ApiResult<ControlsState>> {
-  const body: { ventilation?: boolean; light?: boolean } = {};
+  const body: { ventilation?: boolean; light?: boolean; generator?: boolean } = {};
 
   if (payload.ventilation !== undefined) {
     if (typeof payload.ventilation !== 'boolean') {
@@ -426,8 +427,19 @@ export function saveControls(payload: {
     body.light = payload.light;
   }
 
-  if (body.ventilation === undefined && body.light === undefined) {
-    throw new Error('ventilation or light required.');
+  if (payload.generator !== undefined) {
+    if (typeof payload.generator !== 'boolean') {
+      throw new Error('Generator must be true or false.');
+    }
+    body.generator = payload.generator;
+  }
+
+  if (
+    body.ventilation === undefined &&
+    body.light === undefined &&
+    body.generator === undefined
+  ) {
+    throw new Error('ventilation or light or generator required.');
   }
 
   return postJson<ControlsState>('/api/controls', body, EMPTY_BODY_MESSAGE);

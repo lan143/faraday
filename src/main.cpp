@@ -26,6 +26,7 @@
 
 #include "defines.h"
 #include "config.h"
+#include "automation/automation.h"
 #include "web/handler.h"
 #include "web/reboot_after_response.h"
 
@@ -309,13 +310,15 @@ void setup()
             LOGE("setup", "failed to init light");
         }
 
+        Faraday::Automation::init(&mqtt, &discoveryMgr, device, mqttPrefix);
+
         if (controlBusLocked) {
             xSemaphoreGive(controlBus);
         }
 
-        handler.setControls(&ventilationRelay, &light);
+        handler.setControls(&ventilationRelay, &light, Faraday::Automation::changeover());
     } else {
-        LOGW("setup", "relay expander absent - ventilation/light disabled");
+        LOGW("setup", "relay expander absent - ventilation/light/generator disabled");
     }
 
     inited = true;
@@ -352,13 +355,15 @@ void loop()
         xSemaphoreGive(modbusBus);
     }
 
-    // I2C/MQTT work, not Modbus: drain the relay/light command queues outside
-    // the bus guard. Light::Relay::update() also pumps the backing lightRelay.
-    // The PCF8574 is shared with the web handlers, so hold controlBus across
-    // both updates; on contention skip the block this cycle (retry next).
+    // I2C/MQTT work, not Modbus: drain the relay/light/generator command queues
+    // outside the bus guard. Light::Relay::update() also pumps the backing
+    // lightRelay; the changeover facade pumps its two backing relays in the same
+    // pass. The PCF8574 is shared with the web handlers, so hold controlBus
+    // across all updates; on contention skip the block this cycle (retry next).
     if (relayExpPresent && controlBus != nullptr && xSemaphoreTake(controlBus, pdMS_TO_TICKS(200)) == pdTRUE) {
         ventilationRelay.update();
         light.update();
+        Faraday::Automation::update();
         xSemaphoreGive(controlBus);
     }
 

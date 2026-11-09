@@ -7,13 +7,14 @@ import { Card } from '../components/Card';
 import { Toggle } from '../components/Toggle';
 
 /**
- * Controls tab: on/off switches for the ventilation and light relays.
- * `GET /api/controls` returns the live state; a `null` entity means the relay
- * bus was busy, so the first load renders it as off + muted rather than as an
- * error. Toggles flip optimistically and revert on any failed POST.
+ * Controls tab: on/off switches for the ventilation, light and generator
+ * changeover relays. `GET /api/controls` returns the live state; a `null` entity
+ * means the relay bus was busy, so the first load renders it as off + muted
+ * rather than as an error. Toggles flip optimistically and revert on any failed
+ * POST.
  */
 
-type ControlKey = 'ventilation' | 'light';
+type ControlKey = 'ventilation' | 'light' | 'generator';
 
 interface ControlView {
   value: boolean;
@@ -25,11 +26,13 @@ type ControlViews = Record<ControlKey, ControlView>;
 const INITIAL_VIEWS: ControlViews = {
   ventilation: { value: false, unknown: true },
   light: { value: false, unknown: true },
+  generator: { value: false, unknown: true },
 };
 
 const ENTITIES: ReadonlyArray<{ key: ControlKey; label: string }> = [
   { key: 'ventilation', label: 'Ventilation' },
   { key: 'light', label: 'Light' },
+  { key: 'generator', label: 'Generator' },
 ];
 
 function mergeEntity(previous: ControlView, entity: ControlsEntity): ControlView {
@@ -47,6 +50,7 @@ export function ControlsPage() {
   const [pending, setPending] = useState<Record<ControlKey, boolean>>({
     ventilation: false,
     light: false,
+    generator: false,
   });
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -55,6 +59,7 @@ export function ControlsPage() {
     setViews((current) => ({
       ventilation: mergeEntity(current.ventilation, data.ventilation),
       light: mergeEntity(current.light, data.light),
+      generator: mergeEntity(current.generator, data.generator),
     }));
   }, []);
 

@@ -91,6 +91,7 @@ export interface ControlsEntity {
 export interface ControlsState {
   ventilation: ControlsEntity;
   light: ControlsEntity;
+  generator: ControlsEntity;
 }
 
 /** GET /healthcheck/healty (misspelled intentionally by the firmware lib). */

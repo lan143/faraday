@@ -23,6 +23,8 @@
 // (2/3) was observed firing K6/K5; change channel numbers here only.
 #define VENTILATION_RELAY_CHANNEL 5 // board relay K3
 #define LIGHT_RELAY_CHANNEL 4       // board relay K4
+#define CHANGEOVER_RELAY_K2_CHANNEL 6 // board relay K2 (mains/generator changeover, shared with K5)
+#define CHANGEOVER_RELAY_K5_CHANNEL 3 // board relay K5 (mains/generator changeover, shared with K2)
 
 // Shared sensor/LED connector (one device at a time: DS18B20 / DHT11 / DHT21 / LED strip #2)
 #define SENSOR_BUS_PIN 14
