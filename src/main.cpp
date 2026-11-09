@@ -19,6 +19,8 @@
 #include <sensor/wb_map12e_frequency.h>
 #include <sensor/wb_map12e_energy.h>
 #include <sensor/wb_map12e_reactive_power.h>
+#include <sensor/anenji_sensor.h>
+#include <sensor/anenji_charging_state.h>
 #include <relay/pcf8574.h>
 #include <light/relay_light.h>
 
@@ -41,6 +43,23 @@ EDHA::DiscoveryMgr discoveryMgr;
 EDHA::Device* device = nullptr;
 
 EDWB::MAP12E* map12e = nullptr;
+
+EDWB::ANENJI4200* anenji = nullptr;
+
+Faraday::AnenjiSensor* anenjiMainsVoltageSensor = nullptr;
+Faraday::AnenjiSensor* anenjiMainsCurrentSensor = nullptr;
+Faraday::AnenjiSensor* anenjiMainsPowerSensor = nullptr;
+Faraday::AnenjiSensor* anenjiOutputVoltageSensor = nullptr;
+Faraday::AnenjiSensor* anenjiOutputCurrentSensor = nullptr;
+Faraday::AnenjiSensor* anenjiOutputPowerSensor = nullptr;
+Faraday::AnenjiSensor* anenjiBatteryVoltageSensor = nullptr;
+Faraday::AnenjiSensor* anenjiBatteryCurrentSensor = nullptr;
+Faraday::AnenjiSensor* anenjiBatteryPowerSensor = nullptr;
+Faraday::AnenjiSensor* anenjiPvVoltageSensor = nullptr;
+Faraday::AnenjiSensor* anenjiPvCurrentSensor = nullptr;
+Faraday::AnenjiSensor* anenjiPvPowerSensor = nullptr;
+
+Faraday::BatteryChargingState anenjiCharging;
 
 EDCommon::Sensor::Sensor* supplierEnergy = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyVoltage = nullptr;
@@ -218,6 +237,15 @@ void setup()
     map12e = modbus.addMAP12E(config->map12eAddress);
     handler.setMap12E(map12e);
 
+    LOGI("setup", "init ANENJI 4200");
+    if (config->anenjiAddress > 0) {
+        anenji = modbus.addANENJI4200(config->anenjiAddress);
+        LOGI("setup", "anenji enabled at %u", (unsigned)config->anenjiAddress);
+    } else {
+        LOGI("setup", "anenji disabled");
+    }
+    handler.setAnenji(anenji);
+
     // The device already applies the CT ratio to its measurements; keep the
     // stored ratio in sync with the device because the meter cannot be probed
     // reliably later without a successful read.
@@ -280,6 +308,45 @@ void setup()
             EDCommon::Sensor::withDiscovery(&discoveryMgr, device),
         })) {
         LOGE("setup", "failed to init supplier energy frequency sensor");
+    }
+
+    if (anenji != nullptr) {
+        // Staggered first reads: all 12 sensors would otherwise poll the bus in
+        // the same first microseconds and their synchronized ~300 ms timeout
+        // bursts exceed the project's worst-case stall convention when the
+        // inverter is enabled but absent. Index 0..11 -> 10000..18800 ms.
+        uint8_t anenjiSensorIndex = 0;
+        auto initAnenjiSensor = [&](Faraday::AnenjiSensor*& sensor,
+                                    Faraday::AnenjiSensor::Quantity quantity,
+                                    uint8_t precision,
+                                    const char* name) {
+            sensor = new Faraday::AnenjiSensor(anenji, quantity);
+            if (!sensor->init(precision, 10000 + anenjiSensorIndex * 800, {
+                    EDCommon::Sensor::withMQTT(&mqtt, mqttPrefix, "faraday", name),
+                    EDCommon::Sensor::withDiscovery(&discoveryMgr, device),
+                })) {
+                LOGE("setup", "failed to init %s sensor", name);
+            }
+            ++anenjiSensorIndex;
+        };
+
+        initAnenjiSensor(anenjiMainsVoltageSensor, Faraday::AnenjiSensor::Quantity::MainsVoltage, 1, "Mains voltage");
+        initAnenjiSensor(anenjiMainsCurrentSensor, Faraday::AnenjiSensor::Quantity::MainsCurrent, 1, "Mains current");
+        initAnenjiSensor(anenjiMainsPowerSensor, Faraday::AnenjiSensor::Quantity::MainsPower, 0, "Mains power");
+        initAnenjiSensor(anenjiOutputVoltageSensor, Faraday::AnenjiSensor::Quantity::OutputVoltage, 1, "Output voltage");
+        initAnenjiSensor(anenjiOutputCurrentSensor, Faraday::AnenjiSensor::Quantity::OutputCurrent, 1, "Output current");
+        initAnenjiSensor(anenjiOutputPowerSensor, Faraday::AnenjiSensor::Quantity::OutputPower, 0, "Output power");
+        initAnenjiSensor(anenjiBatteryVoltageSensor, Faraday::AnenjiSensor::Quantity::BatteryVoltage, 1, "Battery voltage");
+        initAnenjiSensor(anenjiBatteryCurrentSensor, Faraday::AnenjiSensor::Quantity::BatteryCurrent, 1, "Battery current");
+        initAnenjiSensor(anenjiBatteryPowerSensor, Faraday::AnenjiSensor::Quantity::BatteryPower, 0, "Battery power");
+        initAnenjiSensor(anenjiPvVoltageSensor, Faraday::AnenjiSensor::Quantity::PvVoltage, 1, "PV voltage");
+        initAnenjiSensor(anenjiPvCurrentSensor, Faraday::AnenjiSensor::Quantity::PvCurrent, 1, "PV current");
+        initAnenjiSensor(anenjiPvPowerSensor, Faraday::AnenjiSensor::Quantity::PvPower, 0, "PV power");
+
+        anenjiCharging.setDevice(anenji);
+        if (!anenjiCharging.init(&mqtt, mqttPrefix, &discoveryMgr, device)) {
+            LOGE("setup", "failed to init battery charging state");
+        }
     }
 
     if (relayExpPresent) {
@@ -352,6 +419,19 @@ void loop()
         if (supplierEnergyPower) supplierEnergyPower->update();
         if (supplierEnergyReactivePower) supplierEnergyReactivePower->update();
         if (supplierEnergyFrequency) supplierEnergyFrequency->update();
+        if (anenjiMainsVoltageSensor) anenjiMainsVoltageSensor->update();
+        if (anenjiMainsCurrentSensor) anenjiMainsCurrentSensor->update();
+        if (anenjiMainsPowerSensor) anenjiMainsPowerSensor->update();
+        if (anenjiOutputVoltageSensor) anenjiOutputVoltageSensor->update();
+        if (anenjiOutputCurrentSensor) anenjiOutputCurrentSensor->update();
+        if (anenjiOutputPowerSensor) anenjiOutputPowerSensor->update();
+        if (anenjiBatteryVoltageSensor) anenjiBatteryVoltageSensor->update();
+        if (anenjiBatteryCurrentSensor) anenjiBatteryCurrentSensor->update();
+        if (anenjiBatteryPowerSensor) anenjiBatteryPowerSensor->update();
+        if (anenjiPvVoltageSensor) anenjiPvVoltageSensor->update();
+        if (anenjiPvCurrentSensor) anenjiPvCurrentSensor->update();
+        if (anenjiPvPowerSensor) anenjiPvPowerSensor->update();
+        if (anenji != nullptr) anenjiCharging.update();
         xSemaphoreGive(modbusBus);
     }
 

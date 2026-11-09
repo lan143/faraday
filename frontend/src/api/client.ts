@@ -1,4 +1,5 @@
 import type {
+  AnenjiReadings,
   ControlsState,
   DeviceStatus,
   EmptyObject,
@@ -66,6 +67,9 @@ export const LIMITS = {
     /** Modbus unit id; `handler.cpp` rejects anything outside 1..247. */
     addressMin: 1,
     addressMax: 247,
+    /** Anenji inverter address; `0` disables it, otherwise 1..247. */
+    anenjiAddressMin: 0,
+    anenjiAddressMax: 247,
   },
   meter: {
     /** `uint16_t` register value; 0 disables the CT ratio. */
@@ -305,7 +309,7 @@ export function postMqtt(payload: MqttPayload): Promise<ActionResult> {
   return sendForm('/api/settings/mqtt', body);
 }
 
-/** GET /api/settings/modbus — RS-485 speed and MAP12E address. */
+/** GET /api/settings/modbus — RS-485 speed, MAP12E and Anenji addresses. */
 export function getModbusSettings(): Promise<ApiResult<ModbusSettings>> {
   return getJson<ModbusSettings>(
     '/api/settings/modbus',
@@ -314,9 +318,9 @@ export function getModbusSettings(): Promise<ApiResult<ModbusSettings>> {
 }
 
 /**
- * POST /api/settings/modbus — persists both fields and returns the refreshed
- * state. The speed applies live; the address takes effect after a reboot.
- * Invalid input throws client-side instead of being sent.
+ * POST /api/settings/modbus — persists all three fields and returns the
+ * refreshed state. The speed applies live; both addresses take effect after a
+ * reboot. Invalid input throws client-side instead of being sent.
  */
 export function saveModbusSettings(
   payload: ModbusPayload,
@@ -335,12 +339,30 @@ export function saveModbusSettings(
       `MAP12E address must be an integer between ${LIMITS.modbus.addressMin} and ${LIMITS.modbus.addressMax}.`,
     );
   }
+  if (
+    !Number.isInteger(payload.anenjiAddress) ||
+    payload.anenjiAddress < LIMITS.modbus.anenjiAddressMin ||
+    payload.anenjiAddress > LIMITS.modbus.anenjiAddressMax
+  ) {
+    throw new Error(
+      `Anenji address must be an integer between ${LIMITS.modbus.anenjiAddressMin} and ${LIMITS.modbus.anenjiAddressMax}.`,
+    );
+  }
   return postJson<ModbusSettings>(
     '/api/settings/modbus',
     {
       modbusSpeed: payload.modbusSpeed,
       map12eAddress: payload.map12eAddress,
+      anenjiAddress: payload.anenjiAddress,
     },
+    EMPTY_BODY_MESSAGE,
+  );
+}
+
+/** GET /api/settings/anenji — live Anenji 4200 inverter readings. */
+export function getAnenjiSettings(): Promise<ApiResult<AnenjiReadings>> {
+  return getJson<AnenjiReadings>(
+    '/api/settings/anenji',
     EMPTY_BODY_MESSAGE,
   );
 }

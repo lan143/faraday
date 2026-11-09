@@ -22,6 +22,7 @@ namespace EDWB
 {
     class WirenBoard;
     class MAP12E;
+    class ANENJI4200;
 }
 
 namespace EDCommon
@@ -53,15 +54,18 @@ public:
 
     void init();
     void setMap12E(EDWB::MAP12E* map12e);
+    void setAnenji(EDWB::ANENJI4200* anenji);
     void setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light, EDCommon::Relay::Relay* generator);
 
 private:
     void registerLogSettingsHandlers();
     void registerModbusSettingsHandlers();
     void registerMeterSettingsHandlers();
+    void registerAnenjiSettingsHandlers();
     void registerControlHandlers();
     void sendModbusSettingsState(AsyncWebServerRequest* request, int status);
     void sendMeterSettingsState(AsyncWebServerRequest* request, int status);
+    void sendAnenjiSettingsState(AsyncWebServerRequest* request, int status);
     // Each pair is <hasValue, value>; a missing value is serialized as null
     // (used when the shared relay bus cannot be locked for a readback).
     void sendControlsState(
@@ -78,6 +82,7 @@ private:
     EDHealthCheck::HealthCheck* _healthCheck = nullptr;
     EDWB::WirenBoard* _modbus = nullptr;
     EDWB::MAP12E* _map12e = nullptr;
+    EDWB::ANENJI4200* _anenji = nullptr;
     EDCommon::Relay::Relay* _ventilationRelay = nullptr;
     EDCommon::Light::Light* _light = nullptr;
     EDCommon::Relay::Relay* _generatorSwitch = nullptr;

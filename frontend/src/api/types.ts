@@ -48,16 +48,21 @@ export interface MqttPayload {
   statusTopic: string;
 }
 
-/** GET /api/settings/modbus — persisted RS-485 speed and MAP12E address. */
+/**
+ * GET /api/settings/modbus — persisted RS-485 speed, MAP12E address and
+ * Anenji inverter address (`0` disables the inverter).
+ */
 export interface ModbusSettings {
   modbusSpeed: number;
   map12eAddress: number;
+  anenjiAddress: number;
 }
 
-/** POST /api/settings/modbus body (JSON). Both fields are required. */
+/** POST /api/settings/modbus body (JSON). All three fields are required. */
 export interface ModbusPayload {
   modbusSpeed: number;
   map12eAddress: number;
+  anenjiAddress: number;
 }
 
 /**
@@ -77,6 +82,31 @@ export interface MeterSettings {
 export interface MeterPayload {
   ct1Ratio?: number;
   energySyncValue?: number;
+}
+
+/**
+ * GET /api/settings/anenji — live Anenji 4200 inverter readings.
+ *
+ * `enabled` is false when the inverter address is 0 or the device is not
+ * present. Every reading is `null` when the inverter is disabled, unreachable
+ * or the Modbus bus is busy. `batteryCharging` is true/false for charging/not
+ * charging and `null` when unknown.
+ */
+export interface AnenjiReadings {
+  enabled: boolean;
+  mainsVoltage: number | null;
+  mainsCurrent: number | null;
+  mainsPower: number | null;
+  outputVoltage: number | null;
+  outputCurrent: number | null;
+  outputPower: number | null;
+  batteryVoltage: number | null;
+  batteryCurrent: number | null;
+  batteryPower: number | null;
+  batteryCharging: boolean | null;
+  pvVoltage: number | null;
+  pvCurrent: number | null;
+  pvPower: number | null;
 }
 
 /**

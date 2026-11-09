@@ -12,15 +12,18 @@ yet: it boots, mounts LittleFS, persists a raw `Config` in `/config.bin`, brings
 device, serves a Preact panel from LittleFS, exposes healthchecks and OTA, probes two PCF8574
 expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, and emits one boot beep.
 
-Three domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
+Four domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
 voltage, current, active power, reactive power, frequency and a software-offset supplier
 energy counter, plus CT-ratio and supplier-sync settings; **relay control** — light and
-ventilation on the KC868-A8S relay bank through the PCF8574 output expander at `0x24`; and a
+ventilation on the KC868-A8S relay bank through the PCF8574 output expander at `0x24`; a
 **manual mains/generator changeover switch** driving board relays K2+K5 through the same
 expander (one HA switch, `faraday/<chip>/generator/state|set`; ON = generator, both relays
-energized). There is **no automatic** network↔generator switching yet — `src/automation/` is
-where that logic will go. There is still **no domain logic** for inputs (expander `0x22`),
-GSM, RF433, LED strips, analog inputs, RS-485 devices other than the WB-MAP12E, or the buzzer
+energized); and optional **Anenji 4200 hybrid inverter telemetry** over the same RS-485 bus
+(12 numeric sensors + one battery-charging binary_sensor, read-only — no inverter control —
+Modbus slave address in config, disabled by default with `anenjiAddress = 0`). There is **no
+automatic** network↔generator switching yet — `src/automation/` is where that logic will go.
+There is still **no domain logic** for inputs (expander `0x22`), GSM, RF433, LED strips,
+analog inputs, RS-485 devices other than the WB-MAP12E and the Anenji 4200, or the buzzer
 beyond the boot beep. Those pins and objects are reserved for the next waves; do not describe
 them as working features. Target hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
 `src/defines.h` declares model `ESP32-LAN8720`, with board revision **TBD**. PlatformIO board
@@ -90,11 +93,15 @@ src/
 ├── config.h                 Config struct persisted raw to /config.bin; CURRENT_VERSION
 ├── automation/
 │   └── automation.h/.cpp    Mains/generator changeover: two MQTT-less PCF8574P backing relays + Relay-derived facade owning topics/discovery; future switching logic
+├── sensor/
+│   ├── wb_map12e_reactive_power.h  Local Faraday::WBMAP12EReactivePower (not yet in ed-common)
+│   ├── anenji_sensor.h      Faraday::AnenjiSensor: 12 read-only Anenji 4200 telemetry quantities on EDCommon::Sensor
+│   └── anenji_charging_state.h/.cpp  Faraday::BatteryChargingState: HA binary_sensor from register 232 sign
 └── web/
-    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/controls routes
+    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/anenji/controls routes
     ├── backup_specs.h       BackupFileSpec table + /api/config handler configs
     └── reboot_after_response.h  Deferred reboot after the HTTP response is flushed
-frontend/                    Preact + TypeScript + Vite SPA sources (tabs incl. Modbus/Meter); npm run build -> data/
+frontend/                    Preact + TypeScript + Vite SPA sources (tabs incl. Modbus/Meter/Anenji); npm run build -> data/
 data/                        Built web UI served from LittleFS (index.html + assets/)
 scripts/
 ├── ota_env.py               Injects .env OTA IP/auth into env:faraday_ota
@@ -108,7 +115,8 @@ Makefile                     OTA deploy orchestration (deploy/backup/restore/sta
 `data/` is build output from `frontend/` — edit the frontend source, not the bundle.
 `frontend/package.json` pulls the network/config/log web components from the sibling
 `ed-network`, `ed-config` and `ed-utils` packages via `file:../../…/frontend` dependencies;
-the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are local pages.
+the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
+`Anenji.tsx`) are local pages.
 
 ## Architecture
 
@@ -117,7 +125,8 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   `networkMgr`, `networkApi`, `mqtt`, `modbus` (`EDWB::WirenBoard` on `Serial2`), `healthCheck`,
   `discoveryMgr`, `map12e` (`EDWB::MAP12E*`), six `EDCommon::Sensor::Sensor*` supplier
   pointers (`supplierEnergy`, `…Voltage`, `…Current`, `…Power`, `…ReactivePower`,
-  `…Frequency`), two `PCF8574`
+  `…Frequency`), `anenji` (`EDWB::ANENJI4200*`) + twelve `Faraday::AnenjiSensor*` telemetry
+  pointers + `Faraday::BatteryChargingState anenjiCharging`, two `PCF8574`
   objects (`0x24` relay, `0x22` input), two `EDCommon::Relay::PCF8574P` objects
   (`ventilationRelay`, `lightRelay`, both over `relayExp`),
   `EDCommon::Light::Relay light` (wraps `lightRelay`), the `controlBus` semaphore and
@@ -134,13 +143,20 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   → ArduinoOTA password/begin → MQTT init → network connect callback (logger + MQTT
   connect/disconnect) → healthcheck registers `mqtt` → network settings callback →
   `handler.init()` → HA discovery init + one `addDevice()` → `modbus.addMAP12E(config
-  address)` + `handler.setMap12E()` → CT-ratio reconciliation (read the device ratio, write
+  address)` + `handler.setMap12E()` → `anenji = config->anenjiAddress > 0 ?
+  modbus.addANENJI4200(addr) : nullptr` (`LOGI` enabled/disabled) + `handler.setAnenji()` →
+  CT-ratio reconciliation (read the device ratio, write
   the stored one back only if it differs; `LOGW` when the meter is unreachable) → six sensor
   objects (`WBMAP12EEnergy` ch 1/L1, precision 2, 60 s, with the `energySyncValue`/
   `energyMeterBase` pointers; `WBMAP12EVoltage` prec 1, 10 s; `WBMAP12ECurrent` prec 2, 10 s;
   `WBMAP12EActivePower` prec 0, 10 s; local `Faraday::WBMAP12EReactivePower` prec 0, 10 s;
   `WBMAP12EFrequency` prec 2, 10 s), each with MQTT +
-  discovery options → a `controlBus`-guarded block that runs only when `relayExpPresent`
+  discovery options → when `anenji != nullptr`: twelve `Faraday::AnenjiSensor` objects
+  (precision 1 for V/A, 0 for W, intervals staggered `10000 + i*800` ms → 10 000–18 800 ms
+  to cap per-pass bus bursts when the inverter is absent, MQTT + discovery, names
+  "Mains/Output/Battery/PV voltage/current/power") → `anenjiCharging.setDevice()` +
+  `init()` (binary_sensor; disabled together with the sensors when `anenjiAddress == 0`, so
+  nothing is created or wired) → a `controlBus`-guarded block that runs only when `relayExpPresent`
   (probe result stored in a flag; when absent the block and the following
   `handler.setControls()` are skipped with a `LOGW`, so the handler pointers stay nullptr)
   (`xSemaphoreTake(controlBus, portMAX_DELAY)` — **never skipped** once entered, because
@@ -155,7 +171,9 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   `inited = true` → one 2700 Hz / 150 ms boot beep.
 - `loop()` order: `RebootAfterResponse::update()` first, then `networkMgr.loop()`,
   `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`, `modbus.loop()`,
-  the six null-guarded sensor `update()` calls (inside the `modbusBus` block), a
+  the six null-guarded supplier `update()` calls plus the twelve null-guarded Anenji sensor
+  updates and `anenjiCharging.update()` (all 19 inside the `modbusBus` block; the charging
+  object throttles its own Modbus read to once per 10 s internally), a
   `controlBus`-guarded `ventilationRelay.update()` + `light.update()` +
   `Faraday::Automation::update()` block **outside**
   the `modbusBus` block, run only when `relayExpPresent` (the probe result stored in a
@@ -170,9 +188,10 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   is false only the deferred-reboot check runs. Modbus bus access is serialized between the
   loop task and the web handlers (AsyncTCP task) by a FreeRTOS binary semaphore
   `modbusBus` (created and initially given as one of the first `setup()` actions): `loop()`
-  wraps `modbus.loop()` + the six `update()` calls in a `xSemaphoreTake(modbusBus, 200 ms)` /
+  wraps `modbus.loop()` + the six supplier and thirteen inverter `update()` calls in a
+  `xSemaphoreTake(modbusBus, 200 ms)` /
   `xSemaphoreGive` pair and skips the whole bus-touching block on contention (sensors retry
-  at their next interval), and the meter/modbus handlers in `src/web/handler.cpp` take the
+  at their next interval), and the meter/modbus/anenji handlers in `src/web/handler.cpp` take the
   same semaphore through the RAII `ModbusGuard` (also 200 ms bounded).
   **Never block the loop**: no `delay()`, no long synchronous I/O; use
   `esp_timer_get_time()` for intervals. Relay/light `setState()` is queue-only and never
@@ -189,25 +208,32 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
     (auto-subscribed to their `.../set` topics).
   - `ed-utils` — `EDUtils::LogConfig`/`NetworkLogger`, `formatString`, `getMacAddress`,
     `getChipID`, `buildJson`, `LOGx` macros.
-  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and entities of three
-    kinds register on it: the six WB-MAP12E sensors (unit/device class/state class), the
-    ventilation and generator **switches**, and the light **light**.
+  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and entities of four
+    kinds register on it: the WB-MAP12E and Anenji numeric sensors (unit/device class/state
+    class), the ventilation and generator **switches**, the light **light**, and the
+    battery-charging **binary_sensor**.
   - `ed-healthcheck` — `Ready` interface + `HealthCheck`; only `mqtt` is registered.
   - `ed-wb` — `EDWB::WirenBoard` (Modbus RTU client over `Stream`) + device drivers; Faraday
     uses `MAP12E` (`getVoltage`/`getCurrent`/`getActivePower`/`getReactivePower`/
     `getFrequency`/`getForwardActiveEnergy`, `getCTTransformRatio`/`setCTTransformRatio`),
-    channel 1 / L1.
+    channel 1 / L1, and `ANENJI4200` (read-only `getMainsVoltage`/`getMainsPower`/
+    `getOutputVoltage`/`getOutputCurrent`/`getOutputActivePower`/`getBatteryVoltage`/
+    `getBatteryCurrent`/`getBatteryPower`/`getPvVoltage`/`getPvCurrent`/`getPvPower`/
+    `getBatteryCurrentFiltered` — registers 202/204/210/211/213/215/216/217/219/220/223/232,
+    no mains-current register).
   - `ed-common` — `EDCommon::Sensor::Sensor` base (precision, update interval, MQTT publish,
-    HA discovery incl. `state_class`) and header-only `WBMAP12E*` subclasses. The energy
+    HA discovery incl. `state_class`) and header-only `WBMAP12E*` subclasses plus the local
+    header-only `Faraday::` subclasses `WBMAP12EReactivePower` and `AnenjiSensor`. The energy
     sensor emulates a resettable counter with `energySyncValue` + (device − `energyMeterBase`).
     Also `EDCommon::Relay::PCF8574P` (channel + shared PCF8574 driver; active-low ON = `LOW`
     is hardcoded in it) and `EDCommon::Light::Relay` (light facade over a backing relay):
     their `init()` auto-subscribes the MQTT command topic and registers the HA switch/light
     entity when given MQTT/discovery options.
   - `ESPAsyncWebServer` — port 80, no authentication.
-- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 3`) holds network, MQTT,
-  HA-discovery flag/prefix, command/state/status topics, log settings, and the Modbus/WB-MAP12E
-  fields (`modbusSpeed` default 9600, `map12eAddress` default 1, `map12eCt1Ratio` default 0,
+- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 4`) holds network, MQTT,
+  HA-discovery flag/prefix, command/state/status topics, log settings, and the
+  Modbus/WB-MAP12E/Anenji fields (`modbusSpeed` default 9600, `map12eAddress` default 1,
+  `map12eCt1Ratio` default 0, `anenjiAddress` default 0 = inverter disabled,
   `energySyncValue`, `energyMeterBase`). The MQTT portion is exposed at `GET /api/settings` and
   written by `POST /api/settings/mqtt`, which mutates the in-RAM `Config` and calls
   `configMgr.store()`; the Modbus and meter sections have their own JSON endpoints. The whole
@@ -219,10 +245,11 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   `load()` falls back to defaults and stores when the CRC/size is invalid. Changes are
   persisted immediately by their handlers; MQTT changes take effect after a reboot, network
   and log settings apply live, Modbus speed applies live (device register write on the old
-  baud, then local `Serial2.begin`), the MAP12E address applies after a reboot, and meter
-  CT-ratio/sync writes hit the device before being stored. There is **no migration layer**:
-  a layout change requires bumping `CURRENT_VERSION`, so a v2 `/config.bin` fails the
-  CRC/size check and is silently replaced by defaults, and v2 backups are rejected on restore.
+  baud, then local `Serial2.begin`), the MAP12E and Anenji addresses apply after a reboot,
+  and meter CT-ratio/sync writes hit the device before being stored. There is **no migration
+  layer**: a layout change requires bumping `CURRENT_VERSION`, so a pre-v4 `/config.bin`
+  fails the CRC/size check and is silently replaced by defaults, and pre-v4 backups are
+  rejected on restore.
 - Backup specs currently contain only `config.bin`; append future domain state files to
   `BackupSpecs::kBackupFiles` (and bump the archive cap only with a reason — the library
   default is 16 KiB).
@@ -251,7 +278,19 @@ the Modbus and Meter tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`) are loc
   ("Generator") on the same device. The two backing changeover relays are initialized with
   empty options, so they own no topics and register nothing; the boot default is mains because
   `relayExp.begin()` leaves the bank all-OFF and the facade seeds its state from that
-  hardware readback.
+  hardware readback. The twelve Anenji sensors publish retained plain values with a 60 s
+  heartbeat on
+  `faraday/<chip>/{mains_voltage,mains_current,mains_power,output_voltage,output_current,
+  output_power,battery_voltage,battery_current,battery_power,pv_voltage,pv_current,
+  pv_power}/state` and register as `measurement`-state-class numeric sensors on the same
+  device; the derived `mains_current` (mains power / voltage, PF = 1 — no register exists)
+  publishes like any normal sensor. `BatteryChargingState` registers one HA
+  **binary_sensor** "Battery charging" (`device_class battery_charging`, `unique_id
+  battery_charging_faraday_<chipID>`) and publishes retained `ON`/`OFF` on
+  `faraday/<chip>/battery_charging/state`: `ON` = filtered battery current (register 232,
+  + charging / − discharging) > 0, `< 0` → `OFF`, 0/failed holds the last state; published on
+  change with a 60 s heartbeat, failed publishes stay pending and are retried, and nothing is
+  published before the first non-zero valid read.
 - Electricity status: an `ElectricityStatus` enum (`OK`, `ON_BATTERY`; `ON_GENERATOR`/`FAIL`
   reserved for future generator/inverter logic and never entered) is derived from the L1
   voltage sensor with hysteresis — `OK` → `ON_BATTERY` at ≤0 V, `ON_BATTERY` → `OK` at >100 V,
@@ -293,10 +332,11 @@ config/backup routes take raw bodies.
 | `/api/wifi/list` | GET | `{networks:[{ssid,rssi,channel,encrypted}]}`; 500 `{"error":"scan failed"}` |
 | `/api/log/settings` | GET | `{host, uri, port, enabled}` |
 | `/api/log/settings` | POST | JSON (max 1024 B): `host`/`uri` required and <64 chars, `port` 1–65535, optional bool `enabled`; host/uri/port persist, `enabled` is runtime-only and follows connectivity; 200 returns the state |
-| `/api/settings/modbus` | GET | JSON `{modbusSpeed, map12eAddress}` (RS-485 speed, MAP12E unit id) |
-| `/api/settings/modbus` | POST | JSON (max 1024 B), both fields required: `modbusSpeed` one of 9600/19200/38400/57600/115200, `map12eAddress` 1–247; speed applies live (device register write on the old baud, then `Serial2.begin`), address after reboot; a `modbusBus` guard timeout logs `modbus bus busy` and skips only the device write while `Serial2` still switches; 422 `{"message":"<field>: required\|invalid value"}`, 500 store failure; 200 returns the refreshed state |
+| `/api/settings/modbus` | GET | JSON `{modbusSpeed, map12eAddress, anenjiAddress}` (RS-485 speed, MAP12E unit id, ANENJI 4200 address; 0 = inverter disabled) |
+| `/api/settings/modbus` | POST | JSON (max 1024 B), all three fields required: `modbusSpeed` one of 9600/19200/38400/57600/115200, `map12eAddress` 1–247, `anenjiAddress` 0–247 (0 = disabled); speed applies live (device register write on the old baud, then `Serial2.begin`), both addresses take effect only after a reboot; a `modbusBus` guard timeout logs `modbus bus busy` and skips only the device write while `Serial2` still switches; 422 `{"message":"<field>: required\|invalid value"}` (incl. `anenjiAddress: required\|invalid value`), 500 store failure; 200 returns the refreshed state |
 | `/api/settings/meter` | GET | JSON `{ct1Ratio, energySyncValue, energyMeterBase, meterEnergy, supplierEnergy}`; the two live readings are `null` while the meter is unreachable or the bus guard times out (still 200) |
 | `/api/settings/meter` | POST | JSON (max 1024 B), at least one of `ct1Ratio` (0–65535) / `energySyncValue` (≥0); device CT write and/or energy read happen **before** store, so 500 `{"message":"meter unreachable"}` aborts without persisting (a bus-guard timeout takes the same path); 422 field errors; 200 returns the refreshed state |
+| `/api/settings/anenji` | GET | Always 200 `{enabled, mainsVoltage, mainsCurrent, mainsPower, outputVoltage, outputCurrent, outputPower, batteryVoltage, batteryCurrent, batteryPower, batteryCharging, pvVoltage, pvCurrent, pvPower}`; every reading is `null` when the inverter is disabled (`anenjiAddress == 0` or `setAnenji()` never wired), the 200 ms `modbusBus` guard times out, or the fast-fail probe fails (a failed first `getMainsVoltage` read skips the remaining 12 reads); on the reachable path each field is `null` iff its own read failed; `batteryCharging` is `bool\|null` from the register 232 sign (0/failed → `null`); no POST on this route |
 | `/api/controls` | GET | JSON `{"ventilation":{"enabled":bool\|null},"light":{"enabled":bool\|null},"generator":{"enabled":bool\|null}}`; a field is `null` when the live readback is unavailable because the 200 ms `controlBus` guard timed out (meter-null convention, still 200); 500 `{"message":"controls not initialized"}` before `handler.setControls()` wiring |
 | `/api/controls` | POST | JSON (max 1024 B), at least one of `ventilation`/`light`/`generator` (booleans): none → 422 `{"message":"ventilation or light or generator: required"}`, non-bool → 422 `{"message":"<field>: invalid value"}`; `setState()` only enqueues (never needs the bus), 200 echoes the requested values for touched fields while untouched fields are a readback or `null` on guard timeout; `500 {"message":"controls busy"}` if a command enqueue fails (full internal queue — rare); no config store, no reboot |
 | `/healthcheck/healty` | GET | Always 200 `{"healty":true}` (the typo is the ed-healthcheck API) |
@@ -304,8 +344,8 @@ config/backup routes take raw bodies.
 
 Route registration order matters: `/api/config/backup` is registered before `/api/config`
 because the shorter matcher is backward-compatible and would otherwise swallow it. Likewise
-`/api/settings/modbus` and `/api/settings/meter` are registered before the plain
-`/api/settings` matcher. `/api/controls` is a distinct prefix with no matcher-order
+`/api/settings/modbus`, `/api/settings/meter` and `/api/settings/anenji` are registered before
+the plain `/api/settings` matcher. `/api/controls` is a distinct prefix with no matcher-order
 interaction with `/api/settings`, so it has no ordering constraint. Reboots are deferred
 through `RebootAfterResponse` so the response
 reaches the client; do not call `ESP.restart()` directly from a handler.
@@ -362,19 +402,40 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   config value (e.g. after a config reset a hand-set meter ratio becomes 0) — set the ratio
   via the Meter tab so it is persisted in config and reconciled back to the meter.
 - Modbus reads run synchronously in the loop task (bounded ~15 ms per transaction timeout,
-  worst-case single-iteration stall when the meter is absent ~135 ms); within the
+  worst-case single-iteration stall when the meter is absent ~135 ms); with an
+  enabled-but-absent inverter the staggered 10 000–18 800 ms sensor intervals normally add
+  only 1–2 extra ~15 ms reads per guarded pass, and `GET /api/settings/anenji` fast-fails
+  with a single probe read when the device is absent. Within the
   never-block-the-loop rule this is the accepted cost — the bus is serialized by the
   `modbusBus` semaphore rather than made asynchronous.
 - `POST /api/settings/modbus` writes the new speed to the bus (ed-wb broadcasts the speed
-  register to Modbus address 0) **before** switching the local `Serial2` baud; the address
-  change only takes effect after a reboot. The endpoint stores config first, so a failed device
+  register to Modbus address 0) **before** switching the local `Serial2` baud; both addresses
+  take effect only after a reboot. The endpoint stores config first, so a failed device
   write logs a warning but is not rolled back. If the bus guard times out (`modbus bus busy`
   warning) the device-side write is skipped but `Serial2` still switches to the persisted
   speed; nothing rewrites the meter's speed register at boot, so the device side stays at the
   old baud until the speed write is re-applied.
-- `CURRENT_VERSION` is 3 with **no migration layer**: an old v2 `/config.bin` fails the
-  CRC/size check and is silently replaced by defaults, and v2 backups are rejected on restore
-  (member size check, with the version byte as a second guard).
+- `CURRENT_VERSION` is 4 with **no migration layer**: a pre-v4 `/config.bin` fails the
+  CRC/size check and is silently replaced by defaults, and pre-v4 (v3) backups are rejected
+  on restore (member size check, with the version byte as a second guard).
+- v4 rejects v3 backups by design: an upgrade effectively resets the config — a pre-v4
+  `/config.bin` fails the CRC/size check and falls back to defaults, and restoring a v3
+  backup is refused; reconfigure (or re-enter settings) after upgrading.
+- `anenjiAddress` defaults to 0 (inverter disabled): enabling requires saving a non-zero
+  address (1–247) on the Modbus tab **and a reboot**; while disabled no bus device, MQTT
+  topics or HA entities exist, loop updates never touch the RS-485 device, and
+  `GET /api/settings/anenji` answers `enabled:false` with every reading `null`.
+- The Anenji mains current has **no register**: it is derived as mains power / mains voltage
+  (PF = 1) and is invalid when the voltage read fails or the voltage is < 0.5 V — an
+  estimate, not a measurement.
+- Register 232 sign convention (+ charging / − discharging), the register scaling and the
+  charging binary_sensor behavior are **hardware-unverified** (datasheet-level claims from
+  the ed-wb driver).
+- The Anenji tab's `Not charging` also means idle: `batteryCharging:false` only reports a
+  non-positive filtered battery current (register 232), not a confirmed discharge.
+- After a config reset the Modbus defaults are already usable (meter address 1, inverter
+  disabled at 0), so no address edit is required for the meter — but a previously enabled
+  inverter must be re-enabled (`anenjiAddress` set + reboot) after a `/config.bin` wipe.
 - `ed-wb` and `ed-common` are git-pinned (`ed-wb#dfa808b1…`, `ed-common#0.6.0`); the WB-MAP12E
   support and the sensor family ship in those releases; `lib_ignore = ESPAsyncTCP, RPAsyncTCP`
   must stay or a clean resolve pulls the wrong TCP stacks.
@@ -404,8 +465,9 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   a failed PCF8574 read returns 0, which the active-low driver would report as ON), while the
   input expander `0x22` still has no domain logic attached.
 - Relays are **ALL OFF after every boot/reboot**: `relayExp.begin()` writes `0xFF` to the
-  bank before any other write, and relay state is intentionally not persisted (no `Config`
-  fields added, `CURRENT_VERSION` stays 3) — there is no startup-state persistence by design.
+  bank before any other write, and relay state is intentionally not persisted (no relay
+  `Config` fields — `CURRENT_VERSION` is 4 only because of `anenjiAddress`) — there is no
+  startup-state persistence by design.
 - The reverse-order mapping K3 → channel 5 (ventilation) / K4 → channel 4 (light) is
   **hardware-verified** (forward mapping 2/3 was observed firing relays K6/K5; the PCF8574
   drives the bank reversed: board relay K_n = channel 8−n, remaining channels inferred from

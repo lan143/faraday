@@ -116,6 +116,7 @@ void Handler::init()
     // "/api/settings/modbus" and "/api/settings/meter".
     registerModbusSettingsHandlers();
     registerMeterSettingsHandlers();
+    registerAnenjiSettingsHandlers();
     registerControlHandlers();
 
     _networkApi->registerRoutes(*_server);
@@ -397,6 +398,11 @@ void Handler::setMap12E(EDWB::MAP12E* map12e)
     _map12e = map12e;
 }
 
+void Handler::setAnenji(EDWB::ANENJI4200* anenji)
+{
+    _anenji = anenji;
+}
+
 void Handler::setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light, EDCommon::Relay::Relay* generator)
 {
     _ventilationRelay = ventilation;
@@ -414,6 +420,7 @@ void Handler::sendModbusSettingsState(AsyncWebServerRequest* request, int status
     std::string payload = EDUtils::buildJson([config](JsonObject entity) {
         entity["modbusSpeed"] = config->modbusSpeed;
         entity["map12eAddress"] = config->map12eAddress;
+        entity["anenjiAddress"] = config->anenjiAddress;
     });
 
     response->write(payload.c_str());
@@ -475,11 +482,31 @@ void Handler::registerModbusSettingsHandlers()
                 return;
             }
 
+            const JsonVariant anenjiAddressValue = json["anenjiAddress"];
+            if (anenjiAddressValue.isNull()) {
+                sendFieldError(request, "anenjiAddress", "required");
+                return;
+            }
+
+            if (!anenjiAddressValue.is<unsigned int>()) {
+                sendFieldError(request, "anenjiAddress", "invalid value");
+                return;
+            }
+
+            const uint32_t anenjiAddress = anenjiAddressValue.as<uint32_t>();
+            if (anenjiAddress > 247) {
+                sendFieldError(request, "anenjiAddress", "invalid value");
+                return;
+            }
+
             Config* config = _configMgr->getData();
             const uint32_t oldSpeed = config->modbusSpeed;
 
             config->modbusSpeed = newSpeed;
             config->map12eAddress = static_cast<uint8_t>(address);
+            // 0 disables the inverter; any other value is its Modbus slave
+            // address. Like map12eAddress, it applies after a reboot.
+            config->anenjiAddress = static_cast<uint8_t>(anenjiAddress);
 
             if (!_configMgr->store()) {
                 request->send(500, "application/json", "{\"message\": \"failed to store config\"}");
@@ -661,6 +688,150 @@ void Handler::registerMeterSettingsHandlers()
     postHandler->setMethod(HTTP_POST);
     postHandler->setMaxContentLength(1024);
     _server->addHandler(postHandler);
+}
+
+void Handler::sendAnenjiSettingsState(AsyncWebServerRequest* request, int status)
+{
+    Config* config = _configMgr->getData();
+    const bool enabled = config->anenjiAddress > 0 && _anenji != nullptr;
+
+    std::pair<bool, float_t> mainsVoltage = {false, 0.0f};
+    std::pair<bool, float_t> mainsCurrent = {false, 0.0f};
+    std::pair<bool, float_t> mainsPower = {false, 0.0f};
+    std::pair<bool, float_t> outputVoltage = {false, 0.0f};
+    std::pair<bool, float_t> outputCurrent = {false, 0.0f};
+    std::pair<bool, float_t> outputPower = {false, 0.0f};
+    std::pair<bool, float_t> batteryVoltage = {false, 0.0f};
+    std::pair<bool, float_t> batteryCurrent = {false, 0.0f};
+    std::pair<bool, float_t> batteryPower = {false, 0.0f};
+    std::pair<bool, float_t> pvVoltage = {false, 0.0f};
+    std::pair<bool, float_t> pvCurrent = {false, 0.0f};
+    std::pair<bool, float_t> pvPower = {false, 0.0f};
+    std::pair<bool, bool> batteryCharging = {false, false};
+
+    // Only the device reads are guarded; JSON serialization stays outside.
+    // A guard miss or a disabled inverter leaves every reading null.
+    if (enabled) {
+        ModbusGuard bus;
+        if (bus.locked) {
+            // Probe with the mains-voltage read first: if the inverter does not
+            // answer, skip the remaining reads (each one a ~timeout on a dead
+            // bus) and leave every reading null.
+            const auto mainsVoltageRead = _anenji->getMainsVoltage();
+            if (mainsVoltageRead.second) {
+                mainsVoltage = {true, mainsVoltageRead.first};
+
+                const auto mainsPowerRead = _anenji->getMainsPower();
+                if (mainsPowerRead.second) {
+                    mainsPower = {true, static_cast<float_t>(mainsPowerRead.first)};
+                }
+
+                // No mains-current register: derive from power/voltage (PF = 1).
+                if (mainsPowerRead.second && mainsVoltageRead.first >= 0.5f) {
+                    mainsCurrent = {true, static_cast<float_t>(mainsPowerRead.first) / mainsVoltageRead.first};
+                }
+
+                const auto outputVoltageRead = _anenji->getOutputVoltage();
+                if (outputVoltageRead.second) {
+                    outputVoltage = {true, outputVoltageRead.first};
+                }
+
+                const auto outputCurrentRead = _anenji->getOutputCurrent();
+                if (outputCurrentRead.second) {
+                    outputCurrent = {true, outputCurrentRead.first};
+                }
+
+                const auto outputPowerRead = _anenji->getOutputActivePower();
+                if (outputPowerRead.second) {
+                    outputPower = {true, static_cast<float_t>(outputPowerRead.first)};
+                }
+
+                const auto batteryVoltageRead = _anenji->getBatteryVoltage();
+                if (batteryVoltageRead.second) {
+                    batteryVoltage = {true, batteryVoltageRead.first};
+                }
+
+                const auto batteryCurrentRead = _anenji->getBatteryCurrent();
+                if (batteryCurrentRead.second) {
+                    batteryCurrent = {true, batteryCurrentRead.first};
+                }
+
+                const auto batteryPowerRead = _anenji->getBatteryPower();
+                if (batteryPowerRead.second) {
+                    batteryPower = {true, static_cast<float_t>(batteryPowerRead.first)};
+                }
+
+                const auto pvVoltageRead = _anenji->getPvVoltage();
+                if (pvVoltageRead.second) {
+                    pvVoltage = {true, pvVoltageRead.first};
+                }
+
+                const auto pvCurrentRead = _anenji->getPvCurrent();
+                if (pvCurrentRead.second) {
+                    pvCurrent = {true, pvCurrentRead.first};
+                }
+
+                const auto pvPowerRead = _anenji->getPvPower();
+                if (pvPowerRead.second) {
+                    pvPower = {true, static_cast<float_t>(pvPowerRead.first)};
+                }
+
+                const auto batteryChargingRead = _anenji->getBatteryCurrentFiltered();
+                if (batteryChargingRead.second) {
+                    if (batteryChargingRead.first > 0.0f) {
+                        batteryCharging = {true, true};
+                    } else if (batteryChargingRead.first < 0.0f) {
+                        batteryCharging = {true, false};
+                    }
+                }
+            }
+        }
+    }
+
+    AsyncResponseStream* response = request->beginResponseStream("application/json");
+    response->setCode(status);
+
+    std::string payload = EDUtils::buildJson([&](JsonObject entity) {
+        entity["enabled"] = enabled;
+
+        auto putFloat = [&entity](const char* key, const std::pair<bool, float_t>& value) {
+            if (value.first) {
+                entity[key] = value.second;
+            } else {
+                entity[key] = nullptr;
+            }
+        };
+
+        putFloat("mainsVoltage", mainsVoltage);
+        putFloat("mainsCurrent", mainsCurrent);
+        putFloat("mainsPower", mainsPower);
+        putFloat("outputVoltage", outputVoltage);
+        putFloat("outputCurrent", outputCurrent);
+        putFloat("outputPower", outputPower);
+        putFloat("batteryVoltage", batteryVoltage);
+        putFloat("batteryCurrent", batteryCurrent);
+        putFloat("batteryPower", batteryPower);
+
+        if (batteryCharging.first) {
+            entity["batteryCharging"] = batteryCharging.second;
+        } else {
+            entity["batteryCharging"] = nullptr;
+        }
+
+        putFloat("pvVoltage", pvVoltage);
+        putFloat("pvCurrent", pvCurrent);
+        putFloat("pvPower", pvPower);
+    });
+
+    response->write(payload.c_str());
+    request->send(response);
+}
+
+void Handler::registerAnenjiSettingsHandlers()
+{
+    _server->on("/api/settings/anenji", HTTP_GET, [this](AsyncWebServerRequest* request) {
+        sendAnenjiSettingsState(request, 200);
+    });
 }
 
 void Handler::sendControlsState(

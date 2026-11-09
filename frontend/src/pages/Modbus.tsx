@@ -9,24 +9,27 @@ import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 
 /**
- * Modbus tab: RS-485 speed and WB-MAP12E unit address. Prefilled from
- * `GET /api/settings/modbus`, validated against the firmware whitelist, and
- * saved with `POST /api/settings/modbus` (JSON). The speed is applied live;
- * the address takes effect after a reboot.
+ * Modbus tab: RS-485 speed, WB-MAP12E unit address and Anenji inverter
+ * address. Prefilled from `GET /api/settings/modbus`, validated against the
+ * firmware whitelist, and saved with `POST /api/settings/modbus` (JSON). The
+ * speed is applied live; both addresses take effect after a reboot.
  */
 
 interface ModbusForm {
   modbusSpeed: string;
   map12eAddress: string;
+  anenjiAddress: string;
 }
 
 interface ModbusErrors {
   map12eAddress?: string;
+  anenjiAddress?: string;
 }
 
 const EMPTY_MODBUS: ModbusForm = {
   modbusSpeed: String(LIMITS.modbus.speeds[0]),
   map12eAddress: '',
+  anenjiAddress: '',
 };
 
 function validateModbus(form: ModbusForm): ModbusErrors {
@@ -42,6 +45,19 @@ function validateModbus(form: ModbusForm): ModbusErrors {
       address > LIMITS.modbus.addressMax
     ) {
       errors.map12eAddress = `Address must be an integer between ${LIMITS.modbus.addressMin} and ${LIMITS.modbus.addressMax}.`;
+    }
+  }
+
+  if (form.anenjiAddress.trim() === '') {
+    errors.anenjiAddress = 'Address is required.';
+  } else {
+    const address = Number(form.anenjiAddress);
+    if (
+      !Number.isInteger(address) ||
+      address < LIMITS.modbus.anenjiAddressMin ||
+      address > LIMITS.modbus.anenjiAddressMax
+    ) {
+      errors.anenjiAddress = `Address must be an integer between ${LIMITS.modbus.anenjiAddressMin} and ${LIMITS.modbus.anenjiAddressMax}.`;
     }
   }
 
@@ -125,6 +141,9 @@ export function ModbusPage() {
   const [form, setForm] = useState<ModbusForm>(EMPTY_MODBUS);
   const [errors, setErrors] = useState<ModbusErrors>({});
   const [loadedAddress, setLoadedAddress] = useState<number | null>(null);
+  const [loadedAnenjiAddress, setLoadedAnenjiAddress] = useState<number | null>(
+    null,
+  );
 
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -137,8 +156,10 @@ export function ModbusPage() {
       setForm({
         modbusSpeed: String(result.data.modbusSpeed),
         map12eAddress: String(result.data.map12eAddress),
+        anenjiAddress: String(result.data.anenjiAddress),
       });
       setLoadedAddress(result.data.map12eAddress);
+      setLoadedAnenjiAddress(result.data.anenjiAddress);
     } else {
       setLoadError(result.message);
     }
@@ -164,19 +185,25 @@ export function ModbusPage() {
       }
 
       const address = Number(form.map12eAddress);
+      const anenjiAddress = Number(form.anenjiAddress);
       setSaving(true);
       try {
         const result = await saveModbusSettings({
           modbusSpeed: Number(form.modbusSpeed),
           map12eAddress: address,
+          anenjiAddress,
         });
         if (result.ok) {
           setForm({
             modbusSpeed: String(result.data.modbusSpeed),
             map12eAddress: String(result.data.map12eAddress),
+            anenjiAddress: String(result.data.anenjiAddress),
           });
-          const addressChanged = address !== loadedAddress;
+          const addressChanged =
+            address !== loadedAddress ||
+            anenjiAddress !== loadedAnenjiAddress;
           setLoadedAddress(result.data.map12eAddress);
+          setLoadedAnenjiAddress(result.data.anenjiAddress);
           setNotice(
             addressChanged
               ? 'Modbus settings saved. The new speed is applied now; the address takes effect only after a reboot.'
@@ -190,7 +217,7 @@ export function ModbusPage() {
       }
       setSaving(false);
     },
-    [form, loadedAddress],
+    [form, loadedAddress, loadedAnenjiAddress],
   );
 
   if (!loaded) {
@@ -229,6 +256,16 @@ export function ModbusPage() {
             max={LIMITS.modbus.addressMax}
             error={errors.map12eAddress}
             help={`Modbus unit id ${LIMITS.modbus.addressMin}-${LIMITS.modbus.addressMax}.`}
+          />
+          <TextField
+            label="ANENJI 4200 address"
+            value={form.anenjiAddress}
+            onInput={(value) => updateForm({ anenjiAddress: value })}
+            type="number"
+            min={LIMITS.modbus.anenjiAddressMin}
+            max={LIMITS.modbus.anenjiAddressMax}
+            error={errors.anenjiAddress}
+            help={`0 disables the inverter; applies after reboot. Valid ${LIMITS.modbus.anenjiAddressMin}-${LIMITS.modbus.anenjiAddressMax}.`}
           />
           {notice ? (
             <Banner

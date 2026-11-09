@@ -9,7 +9,7 @@
 #include "defines.h"
 
 // Bump whenever the persisted layout changes (fields reordered/renamed/retyped).
-#define CURRENT_VERSION 3
+#define CURRENT_VERSION 4
 
 #define MQTT_TOPIC_LEN 64
 
@@ -32,6 +32,8 @@ struct Config
     uint32_t modbusSpeed = 9600;
     uint8_t map12eAddress = 1;
     uint16_t map12eCt1Ratio = 0;
+    // ANENJI 4200 hybrid inverter Modbus slave address; 0 = device disabled.
+    uint8_t anenjiAddress = 0;
     // WB-MAP12E forward-active-energy counters are read-only and can never be
     // reset, so the supplier reading is emulated in software: HA value =
     // energySyncValue + (deviceEnergy - energyMeterBase). energySyncValue is
