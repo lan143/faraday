@@ -40,6 +40,13 @@ function formatCharging(value: boolean | null): string {
   return value ? 'Charging' : 'Not charging';
 }
 
+function formatText(value: string | null): string {
+  if (value === null || value === undefined) {
+    return EM_DASH;
+  }
+  return value;
+}
+
 export function AnenjiPage() {
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -142,6 +149,19 @@ export function AnenjiPage() {
           <dd>{formatCurrent(readings?.pvCurrent ?? null)} A</dd>
           <dt>Power</dt>
           <dd>{formatPower(readings?.pvPower ?? null)} W</dd>
+        </dl>
+      </Card>
+
+      <Card title="Modes">
+        <dl class="kv">
+          <dt>Work mode</dt>
+          <dd>{formatText(readings?.workMode ?? null)}</dd>
+          <dt>Output mode</dt>
+          <dd>{formatText(readings?.outputMode ?? null)}</dd>
+          <dt>Output priority</dt>
+          <dd>{formatText(readings?.outputPriority ?? null)}</dd>
+          <dt>Charge priority</dt>
+          <dd>{formatText(readings?.chargePriority ?? null)}</dd>
         </dl>
       </Card>
 

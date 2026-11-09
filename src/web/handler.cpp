@@ -7,6 +7,7 @@
 #include <log/log.h>
 #include <relay/relay.h>
 #include <light/light.h>
+#include <sensor/anenji_mode_sensor.h>
 #include <wirenboard.h>
 #include <cstring>
 #include <string.h>
@@ -690,6 +691,12 @@ void Handler::registerMeterSettingsHandlers()
     _server->addHandler(postHandler);
 }
 
+// Response contract: {enabled, mainsVoltage, mainsCurrent, mainsPower,
+// outputVoltage, outputCurrent, outputPower, batteryVoltage, batteryCurrent,
+// batteryPower, batteryCharging, pvVoltage, pvCurrent, pvPower,
+// workMode, outputMode, outputPriority, chargePriority}. Every reading is null
+// when the inverter is disabled, the bus guard times out or the probe read
+// fails; the four mode fields are text labels (string) or null.
 void Handler::sendAnenjiSettingsState(AsyncWebServerRequest* request, int status)
 {
     Config* config = _configMgr->getData();
@@ -708,6 +715,10 @@ void Handler::sendAnenjiSettingsState(AsyncWebServerRequest* request, int status
     std::pair<bool, float_t> pvCurrent = {false, 0.0f};
     std::pair<bool, float_t> pvPower = {false, 0.0f};
     std::pair<bool, bool> batteryCharging = {false, false};
+    std::pair<bool, uint16_t> workMode = {false, 0};
+    std::pair<bool, uint16_t> outputMode = {false, 0};
+    std::pair<bool, uint16_t> outputPriority = {false, 0};
+    std::pair<bool, uint16_t> chargePriority = {false, 0};
 
     // Only the device reads are guarded; JSON serialization stays outside.
     // A guard miss or a disabled inverter leaves every reading null.
@@ -784,6 +795,26 @@ void Handler::sendAnenjiSettingsState(AsyncWebServerRequest* request, int status
                         batteryCharging = {true, false};
                     }
                 }
+
+                const auto workModeRead = _anenji->getWorkMode();
+                if (workModeRead.second) {
+                    workMode = {true, static_cast<uint16_t>(workModeRead.first)};
+                }
+
+                const auto outputModeRead = _anenji->getOutputMode();
+                if (outputModeRead.second) {
+                    outputMode = {true, static_cast<uint16_t>(outputModeRead.first)};
+                }
+
+                const auto outputPriorityRead = _anenji->getOutputPriority();
+                if (outputPriorityRead.second) {
+                    outputPriority = {true, static_cast<uint16_t>(outputPriorityRead.first)};
+                }
+
+                const auto chargePriorityRead = _anenji->getBatteryChargePriority();
+                if (chargePriorityRead.second) {
+                    chargePriority = {true, static_cast<uint16_t>(chargePriorityRead.first)};
+                }
             }
         }
     }
@@ -821,6 +852,23 @@ void Handler::sendAnenjiSettingsState(AsyncWebServerRequest* request, int status
         putFloat("pvVoltage", pvVoltage);
         putFloat("pvCurrent", pvCurrent);
         putFloat("pvPower", pvPower);
+
+        auto putMode = [&entity](
+                           const char* key,
+                           const std::pair<bool, uint16_t>& value,
+                           Faraday::AnenjiModeSensor::Kind kind
+                       ) {
+            if (value.first) {
+                entity[key] = Faraday::AnenjiModeSensor::label(kind, value.second);
+            } else {
+                entity[key] = nullptr;
+            }
+        };
+
+        putMode("workMode", workMode, Faraday::AnenjiModeSensor::Kind::WorkMode);
+        putMode("outputMode", outputMode, Faraday::AnenjiModeSensor::Kind::OutputMode);
+        putMode("outputPriority", outputPriority, Faraday::AnenjiModeSensor::Kind::OutputPriority);
+        putMode("chargePriority", chargePriority, Faraday::AnenjiModeSensor::Kind::ChargePriority);
     });
 
     response->write(payload.c_str());

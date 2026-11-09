@@ -104,6 +104,10 @@ export interface AnenjiReadings {
   batteryCurrent: number | null;
   batteryPower: number | null;
   batteryCharging: boolean | null;
+  workMode: string | null;
+  outputMode: string | null;
+  outputPriority: string | null;
+  chargePriority: string | null;
   pvVoltage: number | null;
   pvCurrent: number | null;
   pvPower: number | null;

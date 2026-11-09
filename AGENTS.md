@@ -19,9 +19,11 @@ ventilation on the KC868-A8S relay bank through the PCF8574 output expander at `
 **manual mains/generator changeover switch** driving board relays K2+K5 through the same
 expander (one HA switch, `faraday/<chip>/generator/state|set`; ON = generator, both relays
 energized); and optional **Anenji 4200 hybrid inverter telemetry** over the same RS-485 bus
-(12 numeric sensors + one battery-charging binary_sensor, read-only — no inverter control —
-Modbus slave address in config, disabled by default with `anenjiAddress = 0`). There is **no
-automatic** network↔generator switching yet — `src/automation/` is where that logic will go.
+(12 numeric sensors + one battery-charging binary_sensor + four text-state mode/priority
+sensors — work mode, output mode, output priority, charge priority — read-only, no inverter
+control, Modbus slave address in config, disabled by default with `anenjiAddress = 0`).
+There is **no automatic** network↔generator switching yet — `src/automation/` is where that
+logic will go.
 There is still **no domain logic** for inputs (expander `0x22`), GSM, RF433, LED strips,
 analog inputs, RS-485 devices other than the WB-MAP12E and the Anenji 4200, or the buzzer
 beyond the boot beep. Those pins and objects are reserved for the next waves; do not describe
@@ -96,7 +98,8 @@ src/
 ├── sensor/
 │   ├── wb_map12e_reactive_power.h  Local Faraday::WBMAP12EReactivePower (not yet in ed-common)
 │   ├── anenji_sensor.h      Faraday::AnenjiSensor: 12 read-only Anenji 4200 telemetry quantities on EDCommon::Sensor
-│   └── anenji_charging_state.h/.cpp  Faraday::BatteryChargingState: HA binary_sensor from register 232 sign
+│   ├── anenji_charging_state.h/.cpp  Faraday::BatteryChargingState: HA binary_sensor from register 232 sign
+│   └── anenji_mode_sensor.h/.cpp  Faraday::AnenjiModeSensor: four plain text-state HA sensors (work/output mode, output/charge priority) + single-source `label()`
 └── web/
     ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/anenji/controls routes
     ├── backup_specs.h       BackupFileSpec table + /api/config handler configs
@@ -126,7 +129,9 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   `discoveryMgr`, `map12e` (`EDWB::MAP12E*`), six `EDCommon::Sensor::Sensor*` supplier
   pointers (`supplierEnergy`, `…Voltage`, `…Current`, `…Power`, `…ReactivePower`,
   `…Frequency`), `anenji` (`EDWB::ANENJI4200*`) + twelve `Faraday::AnenjiSensor*` telemetry
-  pointers + `Faraday::BatteryChargingState anenjiCharging`, two `PCF8574`
+  pointers + `Faraday::BatteryChargingState anenjiCharging` + four `Faraday::AnenjiModeSensor`
+  objects (`anenjiWorkModeSensor`, `anenjiOutputModeSensor`, `anenjiOutputPrioritySensor`,
+  `anenjiChargePrioritySensor`), two `PCF8574`
   objects (`0x24` relay, `0x22` input), two `EDCommon::Relay::PCF8574P` objects
   (`ventilationRelay`, `lightRelay`, both over `relayExp`),
   `EDCommon::Light::Relay light` (wraps `lightRelay`), the `controlBus` semaphore and
@@ -156,7 +161,9 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   to cap per-pass bus bursts when the inverter is absent, MQTT + discovery, names
   "Mains/Output/Battery/PV voltage/current/power") → `anenjiCharging.setDevice()` +
   `init()` (binary_sensor; disabled together with the sensors when `anenjiAddress == 0`, so
-  nothing is created or wired) → a `controlBus`-guarded block that runs only when `relayExpPresent`
+  nothing is created or wired) → four `AnenjiModeSensor` `setDevice()` + `init(..., index
+  0..3)` calls (plain text-state HA sensors; first read staggered `800 * index` ms) → a
+  `controlBus`-guarded block that runs only when `relayExpPresent`
   (probe result stored in a flag; when absent the block and the following
   `handler.setControls()` are skipped with a `LOGW`, so the handler pointers stay nullptr)
   (`xSemaphoreTake(controlBus, portMAX_DELAY)` — **never skipped** once entered, because
@@ -171,9 +178,11 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   `inited = true` → one 2700 Hz / 150 ms boot beep.
 - `loop()` order: `RebootAfterResponse::update()` first, then `networkMgr.loop()`,
   `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`, `modbus.loop()`,
-  the six null-guarded supplier `update()` calls plus the twelve null-guarded Anenji sensor
-  updates and `anenjiCharging.update()` (all 19 inside the `modbusBus` block; the charging
-  object throttles its own Modbus read to once per 10 s internally), a
+  the six null-guarded supplier `update()` calls plus the twelve null-guarded Anenji float
+  sensor updates, `anenjiCharging.update()` and the four `anenji != nullptr`-guarded
+  `AnenjiModeSensor::update()` calls (all 23 inside the `modbusBus` block; each object gates
+  its own Modbus read internally — floats staggered 10 000–18 800 ms, charging 10 s, work
+  mode 10 s, the three setting modes 30 s, mode first reads staggered `800 * index` ms), a
   `controlBus`-guarded `ventilationRelay.update()` + `light.update()` +
   `Faraday::Automation::update()` block **outside**
   the `modbusBus` block, run only when `relayExpPresent` (the probe result stored in a
@@ -188,7 +197,7 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   is false only the deferred-reboot check runs. Modbus bus access is serialized between the
   loop task and the web handlers (AsyncTCP task) by a FreeRTOS binary semaphore
   `modbusBus` (created and initially given as one of the first `setup()` actions): `loop()`
-  wraps `modbus.loop()` + the six supplier and thirteen inverter `update()` calls in a
+  wraps `modbus.loop()` + the six supplier and seventeen inverter `update()` calls in a
   `xSemaphoreTake(modbusBus, 200 ms)` /
   `xSemaphoreGive` pair and skips the whole bus-touching block on contention (sensors retry
   at their next interval), and the meter/modbus/anenji handlers in `src/web/handler.cpp` take the
@@ -208,10 +217,12 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
     (auto-subscribed to their `.../set` topics).
   - `ed-utils` — `EDUtils::LogConfig`/`NetworkLogger`, `formatString`, `getMacAddress`,
     `getChipID`, `buildJson`, `LOGx` macros.
-  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and entities of four
+  - `ed-ha` — `EDHA::DiscoveryMgr` + `Device`; one device is created, and entities of five
     kinds register on it: the WB-MAP12E and Anenji numeric sensors (unit/device class/state
-    class), the ventilation and generator **switches**, the light **light**, and the
-    battery-charging **binary_sensor**.
+    class), the four Anenji mode sensors as plain text-state `sensor`s (state topic +
+    `{{ value }}` value template — no unit/device class/state class, `EDHA::Sensor` emits
+    those only when set), the ventilation and generator **switches**, the light **light**,
+    and the battery-charging **binary_sensor**.
   - `ed-healthcheck` — `Ready` interface + `HealthCheck`; only `mqtt` is registered.
   - `ed-wb` — `EDWB::WirenBoard` (Modbus RTU client over `Stream`) + device drivers; Faraday
     uses `MAP12E` (`getVoltage`/`getCurrent`/`getActivePower`/`getReactivePower`/
@@ -290,7 +301,19 @@ the Modbus, Meter and Anenji tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
   `faraday/<chip>/battery_charging/state`: `ON` = filtered battery current (register 232,
   + charging / − discharging) > 0, `< 0` → `OFF`, 0/failed holds the last state; published on
   change with a 60 s heartbeat, failed publishes stay pending and are retried, and nothing is
-  published before the first non-zero valid read.
+  published before the first non-zero valid read. Four `AnenjiModeSensor` objects publish
+  retained human-readable label strings on
+  `faraday/<chip>/{work_mode,output_mode,output_priority,charge_priority}/state` and
+  register plain text-state HA sensors on the same device; labels come from the single-source
+  `Faraday::AnenjiModeSensor::label` — WorkMode 0..6 → `Power on`/`Standby`/`Mains`/
+  `Off grid`/`Bypass`/`Charging`/`Fault`, OutputMode 0..4 → `Single`/`Parallel`/
+  `Three-phase L1/L2/L3`, OutputPriority 0..3 → `Mains-PV-Battery`/
+  `PV-Mains-Battery (inverter)`/`PV-Battery-Mains`/`PV-Mains-Battery (mains)`, ChargePriority
+  0..3 → `Mains preferred`/`PV preferred`/`PV equal mains`/`PV only`, unmapped → `Unknown`;
+  published on change with a 60 s retained heartbeat, a failed read holds the last label,
+  failed publishes stay pending and are retried, and nothing is published before the first
+  valid read. Work mode (register 201) is polled every 10 s, the three setting registers
+  (output mode 300, output priority 301, charge priority 331) every 30 s.
 - Electricity status: an `ElectricityStatus` enum (`OK`, `ON_BATTERY`; `ON_GENERATOR`/`FAIL`
   reserved for future generator/inverter logic and never entered) is derived from the L1
   voltage sensor with hysteresis — `OK` → `ON_BATTERY` at ≤0 V, `ON_BATTERY` → `OK` at >100 V,
@@ -336,7 +359,7 @@ config/backup routes take raw bodies.
 | `/api/settings/modbus` | POST | JSON (max 1024 B), all three fields required: `modbusSpeed` one of 9600/19200/38400/57600/115200, `map12eAddress` 1–247, `anenjiAddress` 0–247 (0 = disabled); speed applies live (device register write on the old baud, then `Serial2.begin`), both addresses take effect only after a reboot; a `modbusBus` guard timeout logs `modbus bus busy` and skips only the device write while `Serial2` still switches; 422 `{"message":"<field>: required\|invalid value"}` (incl. `anenjiAddress: required\|invalid value`), 500 store failure; 200 returns the refreshed state |
 | `/api/settings/meter` | GET | JSON `{ct1Ratio, energySyncValue, energyMeterBase, meterEnergy, supplierEnergy}`; the two live readings are `null` while the meter is unreachable or the bus guard times out (still 200) |
 | `/api/settings/meter` | POST | JSON (max 1024 B), at least one of `ct1Ratio` (0–65535) / `energySyncValue` (≥0); device CT write and/or energy read happen **before** store, so 500 `{"message":"meter unreachable"}` aborts without persisting (a bus-guard timeout takes the same path); 422 field errors; 200 returns the refreshed state |
-| `/api/settings/anenji` | GET | Always 200 `{enabled, mainsVoltage, mainsCurrent, mainsPower, outputVoltage, outputCurrent, outputPower, batteryVoltage, batteryCurrent, batteryPower, batteryCharging, pvVoltage, pvCurrent, pvPower}`; every reading is `null` when the inverter is disabled (`anenjiAddress == 0` or `setAnenji()` never wired), the 200 ms `modbusBus` guard times out, or the fast-fail probe fails (a failed first `getMainsVoltage` read skips the remaining 12 reads); on the reachable path each field is `null` iff its own read failed; `batteryCharging` is `bool\|null` from the register 232 sign (0/failed → `null`); no POST on this route |
+| `/api/settings/anenji` | GET | Always 200 `{enabled, mainsVoltage, mainsCurrent, mainsPower, outputVoltage, outputCurrent, outputPower, batteryVoltage, batteryCurrent, batteryPower, batteryCharging, pvVoltage, pvCurrent, pvPower, workMode, outputMode, outputPriority, chargePriority}`; every reading is `null` when the inverter is disabled (`anenjiAddress == 0` or `setAnenji()` never wired), the 200 ms `modbusBus` guard times out, or the fast-fail probe fails (a failed first `getMainsVoltage` read skips the remaining 15 reads); on the reachable path each field is `null` iff its own read failed; `batteryCharging` is `bool\|null` from the register 232 sign (0/failed → `null`); the four mode fields are `string\|null` labels from `AnenjiModeSensor::label` (`"Unknown"` for unmapped enum values) with the same null semantics as the other readings; read-only — no POST on this route |
 | `/api/controls` | GET | JSON `{"ventilation":{"enabled":bool\|null},"light":{"enabled":bool\|null},"generator":{"enabled":bool\|null}}`; a field is `null` when the live readback is unavailable because the 200 ms `controlBus` guard timed out (meter-null convention, still 200); 500 `{"message":"controls not initialized"}` before `handler.setControls()` wiring |
 | `/api/controls` | POST | JSON (max 1024 B), at least one of `ventilation`/`light`/`generator` (booleans): none → 422 `{"message":"ventilation or light or generator: required"}`, non-bool → 422 `{"message":"<field>: invalid value"}`; `setState()` only enqueues (never needs the bus), 200 echoes the requested values for touched fields while untouched fields are a readback or `null` on guard timeout; `500 {"message":"controls busy"}` if a command enqueue fails (full internal queue — rare); no config store, no reboot |
 | `/healthcheck/healty` | GET | Always 200 `{"healty":true}` (the typo is the ed-healthcheck API) |
@@ -403,11 +426,12 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   via the Meter tab so it is persisted in config and reconciled back to the meter.
 - Modbus reads run synchronously in the loop task (bounded ~15 ms per transaction timeout,
   worst-case single-iteration stall when the meter is absent ~135 ms); with an
-  enabled-but-absent inverter the staggered 10 000–18 800 ms sensor intervals normally add
-  only 1–2 extra ~15 ms reads per guarded pass, and `GET /api/settings/anenji` fast-fails
-  with a single probe read when the device is absent. Within the
-  never-block-the-loop rule this is the accepted cost — the bus is serialized by the
-  `modbusBus` semaphore rather than made asynchronous.
+  enabled-but-absent inverter the staggered 10 000–18 800 ms sensor intervals plus the four
+  extra gated mode reads (work mode every 10 s, the three settings every 30 s, first reads
+  staggered 800 ms * index) normally add at most 1–2 extra ~15 ms reads per guarded pass, and
+  `GET /api/settings/anenji` fast-fails with a single probe read when the device is absent.
+  Within the never-block-the-loop rule this is the accepted cost — the bus is serialized by
+  the `modbusBus` semaphore rather than made asynchronous.
 - `POST /api/settings/modbus` writes the new speed to the bus (ed-wb broadcasts the speed
   register to Modbus address 0) **before** switching the local `Serial2` baud; both addresses
   take effect only after a reboot. The endpoint stores config first, so a failed device
@@ -433,6 +457,15 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   the ed-wb driver).
 - The Anenji tab's `Not charging` also means idle: `batteryCharging:false` only reports a
   non-positive filtered battery current (register 232), not a confirmed discharge.
+- The mode/priority label mapping and enum values follow the ed-wb header
+  (`ANENJIWorkMode`/`ANENJIOutputMode`/`ANENJIOutputPriority`/`ANENJIBatteryChargePriority`)
+  and are **hardware-unverified**: an unknown register value renders as `Unknown` and never
+  crashes; the four HA mode sensors are plain text-state `sensor`s (no numeric history, no
+  `state_class`).
+- The Anenji mode/priority fields are **read-only**: Faraday never writes the inverter's
+  setting registers (ed-wb's `setOutputMode`/`setOutputPriority`/`setBatteryChargePriority`
+  are not wired) — change priorities on the inverter panel. This feature adds no `Config`
+  field: `CURRENT_VERSION` stays 4, so no config reset.
 - After a config reset the Modbus defaults are already usable (meter address 1, inverter
   disabled at 0), so no address edit is required for the meter — but a previously enabled
   inverter must be re-enabled (`anenjiAddress` set + reboot) after a `/config.bin` wipe.

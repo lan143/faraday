@@ -21,6 +21,7 @@
 #include <sensor/wb_map12e_reactive_power.h>
 #include <sensor/anenji_sensor.h>
 #include <sensor/anenji_charging_state.h>
+#include <sensor/anenji_mode_sensor.h>
 #include <relay/pcf8574.h>
 #include <light/relay_light.h>
 
@@ -60,6 +61,11 @@ Faraday::AnenjiSensor* anenjiPvCurrentSensor = nullptr;
 Faraday::AnenjiSensor* anenjiPvPowerSensor = nullptr;
 
 Faraday::BatteryChargingState anenjiCharging;
+
+Faraday::AnenjiModeSensor anenjiWorkModeSensor(Faraday::AnenjiModeSensor::Kind::WorkMode);
+Faraday::AnenjiModeSensor anenjiOutputModeSensor(Faraday::AnenjiModeSensor::Kind::OutputMode);
+Faraday::AnenjiModeSensor anenjiOutputPrioritySensor(Faraday::AnenjiModeSensor::Kind::OutputPriority);
+Faraday::AnenjiModeSensor anenjiChargePrioritySensor(Faraday::AnenjiModeSensor::Kind::ChargePriority);
 
 EDCommon::Sensor::Sensor* supplierEnergy = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyVoltage = nullptr;
@@ -347,6 +353,26 @@ void setup()
         if (!anenjiCharging.init(&mqtt, mqttPrefix, &discoveryMgr, device)) {
             LOGE("setup", "failed to init battery charging state");
         }
+
+        anenjiWorkModeSensor.setDevice(anenji);
+        if (!anenjiWorkModeSensor.init(&mqtt, mqttPrefix, &discoveryMgr, device, 0)) {
+            LOGE("setup", "failed to init work mode sensor");
+        }
+
+        anenjiOutputModeSensor.setDevice(anenji);
+        if (!anenjiOutputModeSensor.init(&mqtt, mqttPrefix, &discoveryMgr, device, 1)) {
+            LOGE("setup", "failed to init output mode sensor");
+        }
+
+        anenjiOutputPrioritySensor.setDevice(anenji);
+        if (!anenjiOutputPrioritySensor.init(&mqtt, mqttPrefix, &discoveryMgr, device, 2)) {
+            LOGE("setup", "failed to init output priority sensor");
+        }
+
+        anenjiChargePrioritySensor.setDevice(anenji);
+        if (!anenjiChargePrioritySensor.init(&mqtt, mqttPrefix, &discoveryMgr, device, 3)) {
+            LOGE("setup", "failed to init charge priority sensor");
+        }
     }
 
     if (relayExpPresent) {
@@ -432,6 +458,10 @@ void loop()
         if (anenjiPvCurrentSensor) anenjiPvCurrentSensor->update();
         if (anenjiPvPowerSensor) anenjiPvPowerSensor->update();
         if (anenji != nullptr) anenjiCharging.update();
+        if (anenji != nullptr) anenjiWorkModeSensor.update();
+        if (anenji != nullptr) anenjiOutputModeSensor.update();
+        if (anenji != nullptr) anenjiOutputPrioritySensor.update();
+        if (anenji != nullptr) anenjiChargePrioritySensor.update();
         xSemaphoreGive(modbusBus);
     }
 
