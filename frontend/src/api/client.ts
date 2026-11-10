@@ -474,7 +474,7 @@ export function saveControls(payload: {
   return postJson<ControlsState>('/api/controls', body, EMPTY_BODY_MESSAGE);
 }
 
-/** GET /api/bms — read-only JBD BMS telemetry snapshot. */
+/** GET /api/bms — JBD BMS telemetry and clear-command status snapshot. */
 export function getBmsState(): Promise<ApiResult<BmsState>> {
   return getJson<BmsState>('/api/bms', EMPTY_BODY_MESSAGE);
 }
@@ -518,6 +518,12 @@ export function postBmsSettings(payload: {
 /** POST /api/bms/scan/start — starts the ~10 s BLE scan on the device. */
 export function postBmsScanStart(): Promise<ActionResult> {
   return send('/api/bms/scan/start', { method: 'POST' });
+}
+
+/** POST /api/bms/clear_errors — queues the one-shot counter clear. */
+export async function postBmsClearErrors(): Promise<ApiResult<void>> {
+  const result = await send('/api/bms/clear_errors', { method: 'POST' });
+  return result.ok ? { ok: true, data: undefined } : result;
 }
 
 /** GET /api/bms/scan/status — scan progress and the latest results. */

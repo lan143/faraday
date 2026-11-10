@@ -52,7 +52,8 @@
 #define GSM_TX 15
 #define GSM_SPEED 115200
 
-// JBD BMS over Bluetooth (read-only telemetry).
+// JBD BMS over Bluetooth (telemetry; the only write is the operator-triggered
+// failed-event-counter clear).
 #define BMS_MAX_CELLS 20
 #define BMS_DEFAULT_CELLS 12
 #define BMS_POLL_INTERVAL_MS 10000

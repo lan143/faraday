@@ -42,12 +42,12 @@ uint16_t Faraday::Bms::Protocol::checksum(const uint8_t* data, uint16_t len)
     return static_cast<uint16_t>(0 - sum);
 }
 
-uint16_t Faraday::Bms::Protocol::buildReadFrame(uint8_t addr, uint8_t* out)
+uint16_t Faraday::Bms::Protocol::buildCommandFrame(uint8_t command, uint8_t address, uint8_t* out)
 {
     out[0] = JBD_PKT_START;
-    out[1] = JBD_CMD_READ;
-    out[2] = addr;
-    out[3] = 0x00;  // payload length for a READ request
+    out[1] = command;
+    out[2] = address;
+    out[3] = 0x00;  // no payload for READ/CLEAR requests
 
     const uint16_t crc = checksum(&out[2], 2);
     out[4] = static_cast<uint8_t>(crc >> 8);
@@ -55,6 +55,11 @@ uint16_t Faraday::Bms::Protocol::buildReadFrame(uint8_t addr, uint8_t* out)
     out[6] = JBD_PKT_END;
 
     return 7;
+}
+
+uint16_t Faraday::Bms::Protocol::buildReadFrame(uint8_t addr, uint8_t* out)
+{
+    return buildCommandFrame(JBD_CMD_READ, addr, out);
 }
 
 void Faraday::Bms::Protocol::FrameAssembler::onNotification(const uint8_t* data, uint16_t len)

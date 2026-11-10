@@ -1072,19 +1072,28 @@ void Handler::registerControlHandlers()
 // totalVoltage, current, power, capacityRemaining, nominalCapacity, cycles,
 // swVersion, mosfetBitmask, protectionBitmask, balancerBitmask,
 // minCellVoltage, maxCellVoltage, avgCellVoltage, deltaCellVoltage,
-// temperatures, cells, errorCounts}. All fields come from one snapshot copy.
+// temperatures, cells, errorCounts, clearGeneration, clearPending,
+// clearResult}. Sensor/cell fields come from one snapshot copy, while
+// clearGeneration/clearPending/clearResult come from their own
+// mutex-guarded client getters.
 void Handler::sendBmsState(AsyncWebServerRequest* request, int status)
 {
     char mac[18] = {0};
     bool hasAddress = false;
     uint8_t configuredCells = 0;
     bool bleUnavailable = false;
+    uint8_t clearGeneration = 0;
+    bool clearPending = false;
+    char clearResult[8] = {0};
     Faraday::Bms::BmsSnapshot snapshot;
 
     if (_bms != nullptr) {
         hasAddress = _bms->address(mac, sizeof(mac));
         configuredCells = _bms->cellCount();
         bleUnavailable = hasAddress && _bms->bleUnavailable();
+        clearGeneration = _bms->clearGeneration();
+        clearPending = _bms->clearPending();
+        _bms->clearResult(clearResult, sizeof(clearResult));
         _bms->copySnapshot(snapshot);
     }
 
@@ -1209,6 +1218,14 @@ void Handler::sendBmsState(AsyncWebServerRequest* request, int status)
             counts["batteryOvervoltage"] = snapshot.errorCounts.batteryOvervoltage;
             counts["batteryUndervoltage"] = snapshot.errorCounts.batteryUndervoltage;
         }
+
+        entity["clearGeneration"] = clearGeneration;
+        entity["clearPending"] = clearPending;
+        if (clearResult[0] == '\0') {
+            entity["clearResult"] = nullptr;
+        } else {
+            entity["clearResult"] = clearResult;
+        }
     });
 
     response->write(payload.c_str());
@@ -1260,6 +1277,33 @@ void Handler::registerBmsHandlers()
 
         response->write(payload.c_str());
         request->send(response);
+    });
+
+    _server->on("/api/bms/clear_errors", HTTP_POST, [this](AsyncWebServerRequest* request) {
+        if (_bms == nullptr) {
+            request->send(500, "application/json", "{\"message\": \"bms not initialized\"}");
+            return;
+        }
+
+        if (_bms->requestClearErrors()) {
+            request->send(200, "application/json", "{}");
+            return;
+        }
+
+        const char* message = nullptr;
+        if (_bms->isScanning()) {
+            message = "scan is running";
+        } else if (!_bms->isConnected()) {
+            message = "bms is not connected";
+        } else if (_bms->clearPending()) {
+            message = "clear already running";
+        } else {
+            message = "bms is not connected";
+        }
+
+        char body[96] = {0};
+        snprintf(body, sizeof(body), "{\"message\": \"%s\"}", message);
+        request->send(422, "application/json", body);
     });
 
     auto* postHandler = new AsyncCallbackJsonWebHandler(

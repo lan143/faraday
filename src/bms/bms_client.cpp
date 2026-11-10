@@ -79,6 +79,12 @@ struct Faraday::Bms::Client::Impl
     uint16_t scanResultCount = 0;
     BmsSnapshot snapshot;
     uint32_t configGeneration = 0;
+    // Failed-event-counter clear state, all guarded by owner->_mutex. The BLE
+    // task consumes clearRequested and publishes clearResult/clearPending.
+    bool clearRequested = false;
+    uint8_t clearGeneration = 0;
+    bool clearPending = false;
+    char clearResult[8] = {0};
     // Guarded by owner->_mutex: written only via markBleUnavailable(), read
     // under lock by Client::bleUnavailable(). The bms task itself reads the
     // raw field as a lock-free fast path (single writer task — do not take
@@ -188,6 +194,14 @@ struct Faraday::Bms::Client::Impl
                 return;
             }
 
+            // A clear request must not wait out the full poll interval.
+            owner->lock();
+            const bool clearWaiting = clearRequested;
+            owner->unlock();
+            if (clearWaiting) {
+                return;
+            }
+
             const int64_t remain = deadline - esp_timer_get_time();
             if (remain <= 0) {
                 return;
@@ -208,6 +222,15 @@ struct Faraday::Bms::Client::Impl
         assembler.reset();
         drainRx();
         updateConnected(false);
+
+        // A clear that never reached the wire fails; do not let it stay
+        // pending across sessions (future requests would be refused forever).
+        owner->lock();
+        const bool clearAborted = clearRequested || clearPending;
+        owner->unlock();
+        if (clearAborted) {
+            finishClear("failed", false);
+        }
     }
 
     bool sendRead(uint8_t addressByte)
@@ -265,6 +288,111 @@ struct Faraday::Bms::Client::Impl
             const uint32_t ticks = static_cast<uint32_t>(remain / 1000) + 1;
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ticks));
         }
+    }
+
+    // Ack shape for the clear command is unknown: JBD may answer with its
+    // function byte or stay silent, so accept any validated (status 0) frame.
+    TxResult waitForAnyFrame(const uint8_t*& data, uint16_t& len, uint32_t generation)
+    {
+        const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(BMS_RESPONSE_TIMEOUT_MS) * 1000;
+
+        for (;;) {
+            RxChunk chunk;
+
+            while (xQueueReceive(rxQueue, &chunk, 0) == pdTRUE) {
+                assembler.onNotification(chunk.data, chunk.len);
+
+                if (assembler.hasFrame()) {
+                    uint8_t function = 0;
+                    uint8_t status = 0;
+                    const uint8_t* frameData = nullptr;
+                    uint16_t frameLen = 0;
+
+                    if (assembler.takeFrame(function, status, frameData, frameLen)) {
+                        data = frameData;
+                        len = frameLen;
+                        return TxResult::Ok;
+                    }
+                }
+            }
+
+            if (bleClient == nullptr || !bleClient->isConnected()) {
+                return TxResult::ConfigChanged;
+            }
+
+            if (configChanged(generation)) {
+                return TxResult::ConfigChanged;
+            }
+
+            const int64_t remain = deadline - esp_timer_get_time();
+            if (remain <= 0) {
+                return TxResult::Timeout;
+            }
+
+            const uint32_t ticks = static_cast<uint32_t>(remain / 1000) + 1;
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ticks));
+        }
+    }
+
+    void finishClear(const char* result, bool zeroCounters)
+    {
+        owner->lock();
+        snprintf(clearResult, sizeof(clearResult), "%s", result);
+        clearPending = false;
+        // A finished/aborted request must never survive into another session:
+        // a leftover clearRequested would silently re-send the command on the
+        // next connect (possibly against a changed MAC) and break the
+        // reconnect backoff / scan wait paths.
+        clearRequested = false;
+        if (zeroCounters) {
+            // Optimistic UI/latency aid, not the truth source: the next 0xAA
+            // poll (<= 10 s) restores the device counters if the command did
+            // not actually clear them.
+            snapshot.errorCounts = BmsErrorCounts();
+            snapshot.hasErrorCounts = true;
+        }
+        owner->unlock();
+
+        LOGI("bms", "failed-event counter clear %s", result);
+    }
+
+    void executeClear(uint8_t requestGeneration, uint32_t generation)
+    {
+        if (bleClient == nullptr || !bleClient->isConnected() || cmdChar == nullptr) {
+            finishClear("failed", false);
+            return;
+        }
+
+        uint8_t frame[7] = {0};
+        const uint16_t frameLen = Protocol::buildCommandFrame(
+            Protocol::JBD_CMD_CLEAR_ERRORS,
+            Protocol::JBD_ADDR_CLEAR_ERRORS,
+            frame
+        );
+
+        // Same write pattern as sendRead(): no-response first, then with-response.
+        bool written = cmdChar->writeValue(frame, frameLen, false);
+        if (!written) {
+            written = cmdChar->writeValue(frame, frameLen, true);
+        }
+
+        if (!written || !bleClient->isConnected()) {
+            finishClear("failed", false);
+            return;
+        }
+
+        LOGI("bms", "sent counter clear command (generation %u)", (unsigned)requestGeneration);
+
+        const uint8_t* data = nullptr;
+        uint16_t len = 0;
+        const TxResult result = waitForAnyFrame(data, len, generation);
+
+        if (result == TxResult::ConfigChanged) {
+            finishClear("failed", false);
+            return;
+        }
+
+        finishClear(result == TxResult::Ok ? "acked" : "sent", true);
     }
 
     TxResult readRequest(uint8_t addressByte, const uint8_t*& data, uint16_t& len, uint32_t generation)
@@ -510,6 +638,22 @@ struct Faraday::Bms::Client::Impl
                     LOGW("bms", "no valid frames for 3 cycles, disconnecting");
                     break;
                 }
+            }
+
+            // One clear command per poll cycle at most, after the 0xAA read has
+            // been applied and before the sleep, so it cannot starve reads.
+            bool clearNow = false;
+            uint8_t requestGeneration = 0;
+            owner->lock();
+            if (clearRequested) {
+                clearRequested = false;
+                requestGeneration = clearGeneration;
+                clearNow = true;
+            }
+            owner->unlock();
+
+            if (clearNow) {
+                executeClear(requestGeneration, generation);
             }
 
             waitAbort(BMS_POLL_INTERVAL_MS, generation);
@@ -975,6 +1119,75 @@ uint32_t Faraday::Bms::Client::scanGeneration() const
     const uint32_t value = _impl->scanGeneration;
     unlock();
     return value;
+}
+
+bool Faraday::Bms::Client::requestClearErrors()
+{
+    if (_impl == nullptr) {
+        return false;
+    }
+
+    lock();
+    const bool eligible = _impl->snapshot.connected
+        && !_impl->scanning
+        && !_impl->bleUnavailable
+        && !_impl->clearPending;
+    if (!eligible) {
+        unlock();
+        return false;
+    }
+
+    _impl->clearRequested = true;
+    ++_impl->clearGeneration;
+    _impl->clearPending = true;
+    const TaskHandle_t task = _impl->task;
+    unlock();
+
+    if (task != nullptr) {
+        xTaskNotifyGive(task);
+    }
+
+    return true;
+}
+
+uint8_t Faraday::Bms::Client::clearGeneration() const
+{
+    if (_impl == nullptr) {
+        return 0;
+    }
+
+    lock();
+    const uint8_t value = _impl->clearGeneration;
+    unlock();
+    return value;
+}
+
+bool Faraday::Bms::Client::clearPending() const
+{
+    if (_impl == nullptr) {
+        return false;
+    }
+
+    lock();
+    const bool value = _impl->clearPending;
+    unlock();
+    return value;
+}
+
+bool Faraday::Bms::Client::clearResult(char* out, size_t n) const
+{
+    if (_impl == nullptr || out == nullptr || n == 0) {
+        return false;
+    }
+
+    lock();
+    const bool hasResult = _impl->clearResult[0] != '\0';
+    if (hasResult) {
+        snprintf(out, n, "%s", _impl->clearResult);
+    }
+    unlock();
+
+    return hasResult;
 }
 
 void Faraday::Bms::Client::lock() const

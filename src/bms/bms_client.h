@@ -56,9 +56,21 @@ namespace Faraday
             uint16_t scanResults(BmsScanResult* out, uint16_t max) const;
             uint32_t scanGeneration() const;
 
-            // Recursive-safe mutex used to guard snapshot/metadata. Bounded
-            // discipline mirrors the other project semaphores: callers must not
-            // hold it across slow work.
+            // Asynchronous request to clear the BMS's latched failed-event
+            // counters. Returns false when not eligible (not connected, BLE
+            // unavailable, scanning or a clear is already pending).
+            bool requestClearErrors();
+            uint8_t clearGeneration() const;
+            bool clearPending() const;
+            // Copies "sent", "acked" or "failed"; empty when never run.
+            // Returns true when a result string is available.
+            bool clearResult(char* out, size_t n) const;
+
+            // Non-recursive mutex (plain xSemaphoreCreateMutex) guarding
+            // snapshot/metadata: it must never be re-entered by a task that
+            // already holds it (that would deadlock). Bounded discipline
+            // mirrors the other project semaphores: callers must not hold it
+            // across slow work.
             void lock() const;
             void unlock() const;
 

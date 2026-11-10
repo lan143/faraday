@@ -184,6 +184,12 @@ export interface BmsState {
   temperatures: number[];
   cells: (number | null)[];
   errorCounts: BmsErrorCounts | null;
+  /** Increments for each accepted failed-event-counter clear request. */
+  clearGeneration: number;
+  /** True while the BLE task is executing a clear command. */
+  clearPending: boolean;
+  /** `null` until a clear completes, then the final outcome. */
+  clearResult: 'sent' | 'acked' | 'failed' | null;
 }
 
 /** One BLE scan hit from `GET /api/bms/scan/status`. */

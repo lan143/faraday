@@ -19,7 +19,13 @@ namespace Faraday
             constexpr uint8_t JBD_PKT_START = 0xDD;
             constexpr uint8_t JBD_PKT_END = 0x77;
             constexpr uint8_t JBD_CMD_READ = 0xA5;
-            constexpr uint8_t JBD_CMD_WRITE = 0x5A;  // out of scope: reads only
+            // The MOSFET-control/write-register dialect is deliberately out of
+            // scope: never build a frame with this opcode.
+            constexpr uint8_t JBD_CMD_WRITE = 0x5A;
+            // Community-captured clear opcode (DD E1 01 00 crc crc 77): clears
+            // the latched failed-event counters read via 0xAA. Hardware-
+            // unverified; this is the only command opcode the firmware emits.
+            constexpr uint8_t JBD_CMD_CLEAR_ERRORS = 0xE1;
 
             // Read addresses.
             constexpr uint8_t JBD_ADDR_BASIC_INFO = 0x03;
@@ -27,11 +33,19 @@ namespace Faraday
             constexpr uint8_t JBD_ADDR_HW_VERSION = 0x05;
             constexpr uint8_t JBD_ADDR_ERROR_COUNTS = 0xAA;
 
+            // Target address of the counter-clear command.
+            constexpr uint8_t JBD_ADDR_CLEAR_ERRORS = 0x01;
+
             // 16-bit value that makes the sum of `data[0..len)` plus it zero.
             uint16_t checksum(const uint8_t* data, uint16_t len);
 
-            // Builds a 7-byte read request into `out` and returns the frame
-            // length (always 7). CRC covers addr + len (frame bytes 2..3).
+            // Builds a 7-byte command frame (DD cmd addr 00 crc crc 77) into
+            // `out` and returns the frame length (always 7). CRC covers
+            // addr + len (frame bytes 2..3).
+            uint16_t buildCommandFrame(uint8_t command, uint8_t address, uint8_t* out);
+
+            // Builds a 7-byte read request; identical to
+            // buildCommandFrame(JBD_CMD_READ, addr, out).
             uint16_t buildReadFrame(uint8_t addr, uint8_t* out);
 
             // Reassembles split BLE notification payloads into complete response

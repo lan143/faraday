@@ -4,6 +4,7 @@ import {
   getBmsScanStatus,
   getBmsState,
   LIMITS,
+  postBmsClearErrors,
   postBmsScanStart,
   postBmsSettings,
 } from '../api/client';
@@ -13,16 +14,18 @@ import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 
 /**
- * BMS tab: read-only JBD battery telemetry over BLE plus the MAC/cell-count
- * settings and a BLE scan picker. `GET /api/bms` returns `null` for every
- * reading until the first valid frame. Polling (both the snapshot and the scan
- * status) is local to the page.
+ * BMS tab: JBD battery telemetry over BLE plus the MAC/cell-count settings, a
+ * BLE scan picker and the operator-triggered failed-event counter clear.
+ * `GET /api/bms` returns `null` for every reading until the first valid frame.
+ * Polling (snapshot, scan status and clear completion) is local to the page.
  */
 
 const EM_DASH = '\u2014';
 const STATE_REFRESH_MS = 10_000;
 const SCAN_POLL_MS = 1_500;
 const SCAN_POLL_CAP_MS = 30_000;
+const CLEAR_POLL_MS = 1_500;
+const CLEAR_POLL_CAP_MS = 25_000;
 
 const ERROR_COUNTERS: ReadonlyArray<{
   key: keyof BmsErrorCounts;
@@ -71,6 +74,19 @@ function formatUptimeMs(value: number | null): string {
     return EM_DASH;
   }
   return `${(value / 1000).toFixed(1)} s`;
+}
+
+function clearResultNotice(result: BmsState['clearResult']): string {
+  switch (result) {
+    case 'acked':
+      return 'BMS acknowledged the clear command; counters re-read within ~10 s.';
+    case 'sent':
+      return 'Command sent (no acknowledgement); counters re-read within ~10 s.';
+    case 'failed':
+      return 'Clear command failed (BLE write or session abort).';
+    default:
+      return 'Clear finished.';
+  }
 }
 
 /** 1-based cell numbers whose bit is set in the 32-bit balancer bitmask. */
@@ -170,16 +186,24 @@ export function BmsPage() {
   const [scanError, setScanError] = useState<string | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
+  const [clearBusy, setClearBusy] = useState(false);
 
   const scanTimer = useRef<number | undefined>(undefined);
   const scanCancelled = useRef(false);
+  const clearTimer = useRef<number | undefined>(undefined);
+  const clearCancelled = useRef(false);
 
   useEffect(() => {
     scanCancelled.current = false;
+    clearCancelled.current = false;
     return () => {
       scanCancelled.current = true;
+      clearCancelled.current = true;
       if (scanTimer.current !== undefined) {
         window.clearTimeout(scanTimer.current);
+      }
+      if (clearTimer.current !== undefined) {
+        window.clearTimeout(clearTimer.current);
       }
     };
   }, []);
@@ -308,6 +332,89 @@ export function BmsPage() {
     void pollScan(Date.now() + SCAN_POLL_CAP_MS);
   }, [scanBusy, pollScan]);
 
+  const pollClear = useCallback(
+    async (deadline: number, generation: number) => {
+      const result = await getBmsState();
+      if (clearCancelled.current) {
+        return;
+      }
+      if (!result.ok) {
+        setActionError(result.message);
+        setClearBusy(false);
+        return;
+      }
+
+      setState(result.data);
+
+      const generationReached =
+        generation < 0 || result.data.clearGeneration >= generation;
+      if (!result.data.clearPending && generationReached) {
+        setClearBusy(false);
+        await load(false);
+        setNotice(clearResultNotice(result.data.clearResult));
+        return;
+      }
+
+      // Cap the extra polling; the 10 s refresh keeps showing the real state.
+      if (Date.now() >= deadline) {
+        setClearBusy(false);
+        setNotice('Clear command is still pending; the tab keeps refreshing every 10 s.');
+        return;
+      }
+
+      clearTimer.current = window.setTimeout(() => {
+        void pollClear(deadline, generation);
+      }, CLEAR_POLL_MS);
+    },
+    [load],
+  );
+
+  const clearErrorCounters = useCallback(async () => {
+    if (
+      clearBusy ||
+      !state?.connected ||
+      scanBusy ||
+      (scanStatus?.running ?? false) ||
+      state.clearPending
+    ) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      'Clear the BMS failed-event counters? This sends a write command over BLE.',
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    const generation = state.clearGeneration;
+    setClearBusy(true);
+    setNotice(null);
+    setActionError(null);
+
+    try {
+      const result = await postBmsClearErrors();
+      if (!result.ok) {
+        setActionError(result.message);
+        setClearBusy(false);
+        return;
+      }
+
+      setNotice('Clear command sent\u2026');
+      if (clearCancelled.current) {
+        setClearBusy(false);
+        return;
+      }
+
+      clearTimer.current = window.setTimeout(() => {
+        void pollClear(Date.now() + CLEAR_POLL_CAP_MS, generation);
+      }, CLEAR_POLL_MS);
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : String(caught));
+      setClearBusy(false);
+    }
+  }, [clearBusy, state, scanBusy, scanStatus, pollClear]);
+
   const selectDevice = useCallback(
     async (deviceMac: string) => {
       const fallback = state?.cellCount ?? LIMITS.bms.cellCountMin;
@@ -345,6 +452,16 @@ export function BmsPage() {
     state !== null &&
     state.reportedCellCount !== null &&
     state.reportedCellCount !== state.cellCount;
+  const errorCounts = state?.errorCounts ?? null;
+  const latchedCounters =
+    errorCounts !== null && ERROR_COUNTERS.some(({ key }) => errorCounts[key] > 0);
+  const clearDisabled =
+    state === null ||
+    !state.connected ||
+    scanBusy ||
+    (scanStatus?.running ?? false) ||
+    state.clearPending ||
+    clearBusy;
 
   return (
     <div class="stack">
@@ -449,7 +566,11 @@ export function BmsPage() {
         <div class="form-actions">
           <Button
             onClick={() => void startScan()}
-            disabled={scanBusy || (scanStatus?.running ?? false)}
+            disabled={
+              scanBusy ||
+              (scanStatus?.running ?? false) ||
+              state?.clearPending === true
+            }
           >
             {scanBusy ? 'Scanning\u2026' : 'Scan'}
           </Button>
@@ -575,6 +696,21 @@ export function BmsPage() {
         ) : (
           <p class="muted">{EM_DASH}</p>
         )}
+        {latchedCounters ? (
+          <p class="muted">
+            These counters are latched: the BMS does not self-clear them, so a
+            historical event keeps the system not-ready until you clear it.
+          </p>
+        ) : null}
+        <div class="form-actions">
+          <Button
+            variant="danger"
+            onClick={() => void clearErrorCounters()}
+            disabled={clearDisabled}
+          >
+            {clearBusy ? 'Clearing\u2026' : 'Clear error counters'}
+          </Button>
+        </div>
       </Card>
     </div>
   );

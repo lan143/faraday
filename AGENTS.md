@@ -24,12 +24,13 @@ energized); and optional **Anenji 4200 hybrid inverter telemetry** over the same
 (12 numeric sensors + one battery-charging binary_sensor + four text-state mode/priority
 sensors — work mode, output mode, output priority, charge priority — read-only, no inverter
 control, Modbus slave address in config, disabled by default with `anenjiAddress = 0`); and
-**read-only JBD BMS telemetry over BLE** (14 aggregate numeric sensors, one voltage sensor per
+**JBD BMS telemetry over BLE** (14 aggregate numeric sensors, one voltage sensor per
 configured cell, four binary sensors — charging/discharging/balancing/fault — and three
 text-state sensors — status/errors/device model). The BMS MAC is entered manually or picked
 from a built-in BLE scan, and a configurable 1–20 cell count makes a 12S pack on a
-20S-capable BMS publish only the real cells. There is no BMS control (no MOSFET/balancer
-writes, no authentication flow). There is **no automatic** network↔generator switching yet — `src/automation/` is where that
+20S-capable BMS publish only the real cells. The only BMS write is the operator-triggered
+failed-event-counter clear (community-captured opcode, hardware-unverified); there are no
+MOSFET/balancer writes and no authentication flow. There is **no automatic** network↔generator switching yet — `src/automation/` is where that
 logic will go.
 There is still **no domain logic** for inputs (expander `0x22`), GSM, RF433, LED strips,
 analog inputs, RS-485 devices other than the WB-MAP12E and the Anenji 4200, or the buzzer
@@ -86,8 +87,8 @@ back up or restore by itself; only `deploy` does. `HOST`, `PIO`, `WAIT_INITIAL`,
 
 Partition layout (`partitions.csv`): two app slots `0x1D0000` = 1,900,544 B (~1.81 MiB) each
 at `0x10000` / `0x1E0000`, and the LittleFS `spiffs` data slot at `0x3B0000` with size
-`0x50000` = 327,680 B (320 KiB). The current firmware is 1,486,048 B
-(~1.42 MiB / ~1.49 MB, 78.2% of an app slot); `data/` is ~164 KiB (`du -sk data`). `make` warns when `data/`
+`0x50000` = 327,680 B (320 KiB). The current firmware is 1,488,352 B
+(~1.42 MiB / ~1.49 MB, 78.3% of an app slot); `data/` is ~164 KiB (`du -sk data`). `make` warns when `data/`
 exceeds 262,144 B (80% of the 327,680 B slot) but still attempts the upload; the device
 reports the real failure.
 
@@ -251,7 +252,10 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   needed). BLE init is lazy — the stack starts on the first scan request or the first
   non-empty MAC, never at idle boot. Failed connections retry with a 5 s → 60 s exponential
   backoff. A connected session reads 0x03 → 0x04 → 0xAA every 10 s and reads model 0x05 once
-  per connection; three consecutive cycles without a valid frame disconnect and retry. A scan
+  per connection; three consecutive cycles without a valid frame disconnect and retry. The
+  session additionally executes at most one pending failed-event-counter clear right after
+  the 0xAA read (a pending clear also wakes the poll wait early); counters are optimistically
+  zeroed on acked/sent and the next 0xAA read restores the device truth within ≤10 s. A scan
   disconnects the BMS, runs ~10 s, and keeps up to 20 results in RAM. BLE init is additionally
   gated on `BMS_MIN_FREE_HEAP_FOR_BLE` (now 60000) so the Wi-Fi fallback can never be
   OOM-killed by the BMS domain (deferred BLE, logged, retried with the reconnect backoff);
@@ -387,7 +391,9 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   / `bms_balancing` / `bms_fault` (publish on change + 60 s heartbeat, silent before the first
   valid frame, hold the last value on a failed read), and three plain text-state sensors
   `bms_status` / `bms_errors` / `bms_device_model` (same publish conventions). With an empty
-  MAC the domain creates zero BMS topics and entities.
+  MAC the domain creates zero BMS topics and entities. `bms_fault` (and `BmsHealth`) treat
+  any non-zero error counter as a hard fault, and JBD latches those counters until the
+  operator clear command (or the JBD app) resets them.
 - Electricity status: an `ElectricityStatus` enum (`OK`, `ON_BATTERY`; `ON_GENERATOR`/`FAIL`
   reserved for future generator/inverter logic and never entered) is derived from the L1
   voltage sensor with hysteresis — `OK` → `ON_BATTERY` at ≤0 V, `ON_BATTERY` → `OK` at >100 V,
@@ -434,10 +440,11 @@ the config/backup routes take raw bodies.
 | `/api/settings/meter` | GET | JSON `{ct1Ratio, energySyncValue, energyMeterBase, meterEnergy, supplierEnergy}`; the two live readings are `null` while the meter is unreachable or the bus guard times out (still 200) |
 | `/api/settings/meter` | POST | JSON (max 1024 B), at least one of `ct1Ratio` (0–65535) / `energySyncValue` (≥0); device CT write and/or energy read happen **before** store, so 500 `{"message":"meter unreachable"}` aborts without persisting (a bus-guard timeout takes the same path); 422 field errors; 200 returns the refreshed state |
 | `/api/settings/anenji` | GET | Always 200 `{enabled, mainsVoltage, mainsCurrent, mainsPower, outputVoltage, outputCurrent, outputPower, batteryVoltage, batteryCurrent, batteryPower, batteryCharging, pvVoltage, pvCurrent, pvPower, workMode, outputMode, outputPriority, chargePriority}`; every reading is `null` when the inverter is disabled (`anenjiAddress == 0` or `setAnenji()` never wired), the 200 ms `modbusBus` guard times out, or the fast-fail probe fails (a failed first `getMainsVoltage` read skips the remaining 15 reads); on the reachable path each field is `null` iff its own read failed; `batteryCharging` is `bool\|null` from the register 232 sign (0/failed → `null`); the four mode fields are `string\|null` labels from `AnenjiModeSensor::label` (`"Unknown"` for unmapped enum values) with the same null semantics as the other readings; read-only — no POST on this route |
-| `/api/bms` | GET | Always 200 when wired: `{enabled, bleUnavailable, mac, cellCount, connected, lastUpdateMs, reportedCellCount, status, errors, deviceModel, soc, totalVoltage, current, power, capacityRemaining, nominalCapacity, cycles, swVersion, mosfetBitmask, protectionBitmask, balancerBitmask, temperatures, cells, errorCounts}`; `mac` is `""` when unset; every reading is `null` until the first valid JBD frame; `cells` has exactly `cellCount` entries; `errorCounts` is `null` or 11 integer keys; 500 `{"message":"bms not initialized"}` before `handler.setBms()` wiring |
+| `/api/bms` | GET | Always 200 when wired: `{enabled, bleUnavailable, mac, cellCount, connected, lastUpdateMs, reportedCellCount, status, errors, deviceModel, soc, totalVoltage, current, power, capacityRemaining, nominalCapacity, cycles, swVersion, mosfetBitmask, protectionBitmask, balancerBitmask, temperatures, cells, errorCounts, clearGeneration, clearPending, clearResult}`; `mac` is `""` when unset; every reading is `null` until the first valid JBD frame; `cells` has exactly `cellCount` entries; `errorCounts` is `null` or 11 integer keys; `clearResult` stays `null` until a clear completes, then `"sent"` (no ack within the timeout), `"acked"` or `"failed"`; `clearPending` is `true` while the BLE task is executing the clear command; 500 `{"message":"bms not initialized"}` before `handler.setBms()` wiring |
 | `/api/bms/settings` | POST | JSON (max 1024 B), both `mac` (empty disables; otherwise normalized `AA:BB:CC:DD:EE:FF`) and `cellCount` (1..20) required; 422 `{"message":"<field>: required\|invalid value"}`, 500 `{"message":"failed to store config"\|"bms not initialized"}`, 200 returns the full refreshed BMS state; MAC/cell count apply live to BLE polling, MQTT/HA discovery changes need a reboot |
 | `/api/bms/scan/start` | POST | Starts the ~10 s BLE scan; 200 `{}`, 422 `{"message":"scan already running"}`, 500 `{"message":"bms not initialized"}`; disconnects the BMS while scanning |
 | `/api/bms/scan/status` | GET | 200 `{running, generation, devices:[{mac,name,rssi}]}`; results persist after the scan ends (RAM-only, max 20); 500 `{"message":"bms not initialized"}` |
+| `/api/bms/clear_errors` | POST | Sends the one-shot JBD failed-event-counter clear command (hardware-unverified `DD E1 01 00 FF FF 77`, no `0x5A` write); the BLE task executes it after the next 0xAA poll, optimistic counters zero until the next 0xAA read; 200 `{}`, 422 `{"message":"scan is running"\|"bms is not connected"\|"clear already running"}`, 500 `{"message":"bms not initialized"}`; no config store, no reboot |
 | `/api/controls` | GET | JSON `{"ventilation":{"enabled":bool\|null},"light":{"enabled":bool\|null},"generator":{"enabled":bool\|null}}`; a field is `null` when the live readback is unavailable because the 200 ms `controlBus` guard timed out (meter-null convention, still 200); 500 `{"message":"controls not initialized"}` before `handler.setControls()` wiring |
 | `/api/controls` | POST | JSON (max 1024 B), at least one of `ventilation`/`light`/`generator` (booleans): none → 422 `{"message":"ventilation or light or generator: required"}`, non-bool → 422 `{"message":"<field>: invalid value"}`; `setState()` only enqueues (never needs the bus), 200 echoes the requested values for touched fields while untouched fields are a readback or `null` on guard timeout; `500 {"message":"controls busy"}` if a command enqueue fails (full internal queue — rare); no config store, no reboot |
 | `/healthcheck/healty` | GET | Always 200 `{"healty":true}` (the typo is the ed-healthcheck API) |
@@ -446,8 +453,9 @@ the config/backup routes take raw bodies.
 Route registration order matters: `/api/config/backup` is registered before `/api/config`
 because the shorter matcher is backward-compatible and would otherwise swallow it. Likewise
 `/api/settings/modbus`, `/api/settings/meter` and `/api/settings/anenji` are registered before
-the plain `/api/settings` matcher, and `/api/bms/scan/start`, `/api/bms/scan/status` and
-`/api/bms/settings` before the plain `/api/bms` matcher (`registerBmsHandlers()` sits between
+the plain `/api/settings` matcher, and `/api/bms/scan/start`, `/api/bms/scan/status`,
+`/api/bms/settings` and `/api/bms/clear_errors` before the plain `/api/bms` matcher
+(`registerBmsHandlers()` sits between
 the controls and `networkApi` registration). `/api/controls` is a distinct prefix with no
 matcher-order interaction with `/api/settings`, so it has no ordering constraint. Reboots are deferred
 through `RebootAfterResponse` so the response
@@ -688,12 +696,19 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   append by remaining capacity).
 - A BLE scan **disconnects the BMS** while it runs (~10 s). Scan results are RAM-only, keep up
   to 20 devices, and persist after the scan finishes; a new scan replaces them.
-- The BMS is **read-only**: Faraday never writes MOSFET/balancer commands and does not port
-  the JBD authentication flow. `balancerBitmask` bit i = cell i+1 (cells 17–32 come from
-  payload bytes 14–15) and the JBD current/capacity scale (0.1 vs 0.01 depending on
-  MOSFET-bit7) are ported from esphome-jbd-bms and **hardware-unverified**.
+- The BMS is **read-only except the operator-triggered failed-event-counter clear**: Faraday
+  never writes MOSFET/balancer commands and does not port the JBD authentication flow. The
+  counters latch until cleared, which is why a historical event keeps the system not-ready/red
+  forever; the clear opcode `DD E1 01 00 crc crc 77` is community-captured
+  (`JBD_CMD_CLEAR_ERRORS 0xE1` + address `0x01`) and **hardware-unverified** — if the counters
+  persist after the button, either the pack firmware requires authentication or the opcode
+  differs. **Never** emit the write-register form `DD 5A E1 ...`: that is MOSFET control
+  (proven by syssi PulseView captures) and would switch charge/discharge. `balancerBitmask`
+  bit i = cell i+1 (cells 17–32 come from payload bytes 14–15) and the JBD current/capacity
+  scale (0.1 vs 0.01 depending on MOSFET-bit7) are ported from esphome-jbd-bms and
+  **hardware-unverified**.
 - BMS support grew the firmware by roughly 297 KB with NimBLE-Arduino; the app slot still has
-  ~414 KB of headroom at 1,486,048 B used (78.2%). OTA and USB flashing are unaffected.
+  ~412 KB of headroom at 1,488,352 B used (78.3%). OTA and USB flashing are unaffected.
 - A v5 upgrade resets `/config.bin` (pre-v5 fails CRC/size) and rejects v4 backups — re-enter
   the BMS MAC/cell count after upgrading.
 - Library APIs change: read the checked-out sources under `.pio/libdeps/faraday/<lib>/src`
