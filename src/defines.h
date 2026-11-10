@@ -77,8 +77,11 @@
 // Buzzer
 #define BUZZER_PIN 2
 
-// WS2812B RGBW status LED strip #1 (reserved; no LED domain yet)
+// WS2812B RGBW single-pixel board status LED, driven by
+// Faraday::Health::StatusLed as a health indicator.
 #define STATUS_LED_PIN 12
+#define STATUS_LED_COUNT 1
+#define STATUS_LED_BRIGHTNESS 80
 
 #ifndef CONTROLLER_NAME
 #define CONTROLLER_NAME "Faraday"

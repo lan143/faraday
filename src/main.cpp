@@ -24,6 +24,8 @@
 #include <sensor/anenji_mode_sensor.h>
 #include <relay/pcf8574.h>
 #include <light/relay_light.h>
+#include <health/device_health.h>
+#include <health/status_led.h>
 
 #include <string>
 
@@ -41,12 +43,17 @@ EDMQTT::MQTT mqtt;
 EDWB::WirenBoard modbus(Serial2);
 
 EDHealthCheck::HealthCheck healthCheck;
+Faraday::Health::StatusLed statusLed;
 EDHA::DiscoveryMgr discoveryMgr;
 EDHA::Device* device = nullptr;
 
 EDWB::MAP12E* map12e = nullptr;
 
 EDWB::ANENJI4200* anenji = nullptr;
+
+Faraday::Health::MeterHealth* meterHealth = nullptr;
+Faraday::Health::InverterHealth* inverterHealth = nullptr;
+Faraday::Health::BmsHealth* bmsHealth = nullptr;
 
 Faraday::AnenjiSensor* anenjiMainsVoltageSensor = nullptr;
 Faraday::AnenjiSensor* anenjiMainsCurrentSensor = nullptr;
@@ -218,6 +225,25 @@ void setup()
         }
     });
     healthCheck.registerService(&mqtt);
+
+    // Device health services. Registration order is the aggregation order:
+    // mqtt, meter, inverter, bms. A device disabled at boot gets no service, so
+    // the default config exposes mqtt + meter only. Register before
+    // handler.init() starts the web server because the ed-healthcheck service
+    // list is not locked; adapters resolve their device pointers lazily
+    // (map12e/anenji are assigned later in setup(), BMS client after
+    // Faraday::Bms::init()).
+    Config* healthConfig = configMgr.getData();
+    meterHealth = new Faraday::Health::MeterHealth(modbusBus, &map12e);
+    healthCheck.registerService(meterHealth);
+    if (healthConfig->anenjiAddress > 0) {
+        inverterHealth = new Faraday::Health::InverterHealth(modbusBus, &anenji);
+        healthCheck.registerService(inverterHealth);
+    }
+    if (healthConfig->bmsMacAddress[0] != '\0') {
+        bmsHealth = new Faraday::Health::BmsHealth();
+        healthCheck.registerService(bmsHealth);
+    }
 
     networkApi.onSettingsChanged([&](const EDNetwork::Config& config) -> bool {
         configMgr.getData()->network = config;
@@ -426,6 +452,8 @@ void setup()
     inited = true;
     LOGI("setup", "complete");
 
+    statusLed.begin();
+
     // Single short boot-feedback beep; no other buzzer usage yet.
     tone(BUZZER_PIN, 2700, 150);
 }
@@ -442,6 +470,7 @@ void loop()
     discoveryMgr.loop();
     ArduinoOTA.handle();
     healthCheck.loop();
+    statusLed.update(mqtt.isConnected(), meterHealth, inverterHealth, bmsHealth);
     // The bus is shared with the web handlers running in the AsyncTCP task:
     // hold the binary semaphore across modbus.loop() and the sensor polls. On
     // contention (take timeout) skip the whole bus-touching block this cycle:

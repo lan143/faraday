@@ -9,9 +9,10 @@ Faraday is the **base controller skeleton** for a DIY ESP32 + LAN8720 board, mod
 `prometey` and the same `ed-*` library family. It is intentionally not a finished controller
 yet: it boots, mounts LittleFS, persists a raw `Config` in `/config.bin`, brings up Ethernet
 (LAN8720) with Wi-Fi/AP fallback, connects to MQTT, creates one Home Assistant discovery
-device, serves a Preact panel from LittleFS, exposes healthchecks and OTA, probes two PCF8574
-expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, reads a JBD BMS over
-BLE, and emits one boot beep.
+device, serves a Preact panel from LittleFS, exposes healthchecks and OTA, drives the
+single-pixel status LED as a health indicator (green = ok, yellow = warning, red = error),
+probes two PCF8574 expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, reads
+a JBD BMS over BLE, and emits one boot beep.
 
 Five domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
 voltage, current, active power, reactive power, frequency and a software-offset supplier
@@ -55,8 +56,9 @@ The env also sets
 transitively through library manifests, and a clean dependency resolve breaks unless they are
 excluded (`AsyncTCP` is the ESP32 stack). Keep both entries when editing `lib_deps`.
 
-`lib_deps` also includes `h2zero/NimBLE-Arduino@==1.4.3` for the BMS BLE domain; the
-`lib_ignore` rule above is unchanged.
+`lib_deps` also includes `h2zero/NimBLE-Arduino@==1.4.3` for the BMS BLE domain and
+`adafruit/Adafruit NeoPixel@==1.12.3` for the single-pixel status LED (`STATUS_LED_PIN`
+GPIO12, GRBW type); the `lib_ignore` rule above is unchanged.
 
 OTA target and auth come from the **untracked** project-root `/.env` (copy `.env.example`):
 `FARADAY_OTA_IP` and `FARADAY_OTA_AUTH`. `scripts/ota_env.py` injects them into
@@ -84,8 +86,8 @@ back up or restore by itself; only `deploy` does. `HOST`, `PIO`, `WAIT_INITIAL`,
 
 Partition layout (`partitions.csv`): two app slots `0x1D0000` = 1,900,544 B (~1.81 MiB) each
 at `0x10000` / `0x1E0000`, and the LittleFS `spiffs` data slot at `0x3B0000` with size
-`0x50000` = 327,680 B (320 KiB). The current firmware is 1,472,768 B
-(~1.40 MiB / ~1.47 MB, 77.5% of an app slot); `data/` is ~164 KiB (`du -sk data`). `make` warns when `data/`
+`0x50000` = 327,680 B (320 KiB). The current firmware is 1,486,048 B
+(~1.42 MiB / ~1.49 MB, 78.2% of an app slot); `data/` is ~164 KiB (`du -sk data`). `make` warns when `data/`
 exceeds 262,144 B (80% of the 327,680 B slot) but still attempts the upload; the device
 reports the real failure.
 
@@ -108,6 +110,9 @@ src/
 │   ├── bms_client.h/.cpp    NimBLE client + dedicated "bms" task, snapshot mutex and BLE scan
 │   ├── bms_sensors.h/.cpp   Faraday numeric/binary/text HA sensor classes over the snapshot
 │   └── bms.h/.cpp           Facade like automation.cpp: client singleton + sensor wiring
+├── health/
+│   ├── device_health.h/.cpp Three ed-healthcheck Ready adapters: self-throttled Modbus probes for the WB-MAP12E and Anenji 4200, BMS snapshot warnings/faults
+│   └── status_led.h/.cpp    Single-pixel health LED: green ok / yellow warning / red error, painted only on change
 ├── automation/
 │   └── automation.h/.cpp    Mains/generator changeover: two MQTT-less PCF8574P backing relays + Relay-derived facade owning topics/discovery; future switching logic
 ├── sensor/
@@ -149,8 +154,9 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   `anenjiChargePrioritySensor`), two `PCF8574`
   objects (`0x24` relay, `0x22` input), two `EDCommon::Relay::PCF8574P` objects
   (`ventilationRelay`, `lightRelay`, both over `relayExp`),
-  `EDCommon::Light::Relay light` (wraps `lightRelay`), the `controlBus` semaphore and
-  `Handler`. The mains/generator changeover objects (two `EDCommon::Relay::PCF8574P` backing
+  `EDCommon::Light::Relay light` (wraps `lightRelay`), the `controlBus` semaphore,
+  `Handler`, `Faraday::Health::StatusLed statusLed`, and the optional health adapters
+  (`meterHealth`, `inverterHealth`, `bmsHealth`; see `src/health/`). The mains/generator changeover objects (two `EDCommon::Relay::PCF8574P` backing
   relays over `relayExp` and a `Relay`-derived `GeneratorChangeover` facade) live at file
   scope in `src/automation/automation.cpp`, which `extern`s `relayExp` — not in `main.cpp`.
   The BMS objects (NimBLE client, dedicated task state, snapshot cache and sensor vectors) live
@@ -165,7 +171,11 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   placeholder) → `Wire` at 100 kHz → PCF8574 probes (relay probe result stored in the
   `relayExpPresent` flag) → `networkMgr.init(..., hasEth=true, ...)`
   → ArduinoOTA password/begin → MQTT init → network connect callback (logger + MQTT
-  connect/disconnect) → healthcheck registers `mqtt` → network settings callback →
+  connect/disconnect) → healthcheck registers `mqtt`, `MeterHealth`, optional `InverterHealth`
+  and `BmsHealth` (in that order, all before `handler.init()` starts the web server because
+  the ed-healthcheck service list is not locked; disabled-at-boot devices get no service;
+  adapters hold device-pointer slots and resolve them lazily because `map12e`/`anenji`/the
+  BMS client are assigned later in `setup()`) → network settings callback →
   `handler.init()` → HA discovery init + one `addDevice()` → `modbus.addMAP12E(config
   address)` + `handler.setMap12E()` → `anenji = config->anenjiAddress > 0 ?
   modbus.addANENJI4200(addr) : nullptr` (`LOGI` enabled/disabled) + `handler.setAnenji()` →
@@ -197,9 +207,11 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   with `withMQTT(..., "Generator")` + `withDiscovery`, which auto-subscribes
   `faraday/<chip>/generator/set` and registers one HA switch on the same device), then
   `handler.setControls(&ventilationRelay, &light, Faraday::Automation::changeover())` →
-  `inited = true` → one 2700 Hz / 150 ms boot beep.
+  `inited = true` → `statusLed.begin()` → one 2700 Hz / 150 ms boot beep.
 - `loop()` order: `RebootAfterResponse::update()` first, then `networkMgr.loop()`,
-  `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`, `modbus.loop()`,
+  `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`,
+  `statusLed.update(mqtt.isConnected(), meterHealth, inverterHealth, bmsHealth)` (reads the
+  adapters' cached `level()` getters only and paints only on change/first), `modbus.loop()`,
   the six null-guarded supplier `update()` calls plus the twelve null-guarded Anenji float
   sensor updates, `anenjiCharging.update()` and the four `anenji != nullptr`-guarded
   `AnenjiModeSensor::update()` calls (all 23 inside the `modbusBus` block; each object gates
@@ -266,7 +278,10 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
     class/state class, `EDHA::Sensor` emits those only when set), the ventilation and
     generator **switches**, the light **light**, and the battery-charging/BMS
     **binary_sensors**.
-  - `ed-healthcheck` — `Ready` interface + `HealthCheck`; only `mqtt` is registered.
+  - `ed-healthcheck` — `Ready` interface + `HealthCheck`. Registered services, in order:
+    `mqtt` always, then `MeterHealth`, `InverterHealth` (only when `anenji != nullptr` at
+    boot) and `BmsHealth` (only when a BMS MAC is configured at boot). The device adapters
+    live in `src/health/`.
   - `ed-wb` — `EDWB::WirenBoard` (Modbus RTU client over `Stream`) + device drivers; Faraday
     uses `MAP12E` (`getVoltage`/`getCurrent`/`getActivePower`/`getReactivePower`/
     `getFrequency`/`getForwardActiveEnergy`, `getCTTransformRatio`/`setCTTransformRatio`),
@@ -426,7 +441,7 @@ the config/backup routes take raw bodies.
 | `/api/controls` | GET | JSON `{"ventilation":{"enabled":bool\|null},"light":{"enabled":bool\|null},"generator":{"enabled":bool\|null}}`; a field is `null` when the live readback is unavailable because the 200 ms `controlBus` guard timed out (meter-null convention, still 200); 500 `{"message":"controls not initialized"}` before `handler.setControls()` wiring |
 | `/api/controls` | POST | JSON (max 1024 B), at least one of `ventilation`/`light`/`generator` (booleans): none → 422 `{"message":"ventilation or light or generator: required"}`, non-bool → 422 `{"message":"<field>: invalid value"}`; `setState()` only enqueues (never needs the bus), 200 echoes the requested values for touched fields while untouched fields are a readback or `null` on guard timeout; `500 {"message":"controls busy"}` if a command enqueue fails (full internal queue — rare); no config store, no reboot |
 | `/healthcheck/healty` | GET | Always 200 `{"healty":true}` (the typo is the ed-healthcheck API) |
-| `/healthcheck/ready` | GET | 200 `{"ready":true,"message":…,"warning":…,"warningMessage":…}` or 500 `ready:false`; only the MQTT service is registered, so an unconfigured/disconnected broker shows not ready |
+| `/healthcheck/ready` | GET | 200 `{"ready":true,"message":…,"warning":…,"warningMessage":…}` or 500 `ready:false`. Services in order: `mqtt`, then meter, inverter (only when enabled at boot) and BMS (only when a MAC is configured at boot). MQTT not connected, meter/inverter unreachable (`wb-map12e is not responding` / `anenji is not responding`) or a device fault (Anenji fault code / work mode Fault, BMS protection bits or non-zero error counters) => `ready:false`/500 (generic `service success count less min sucess count` until the 4th consecutive failing check). BMS BLE unavailable/disconnected/stale and an active Anenji warning (`anenji warning code 0x...`, register 104) => `warning:true` with `warningMessage` (`bms: BLE stack unavailable`, `bms is not connected`, `bms data is stale`, `anenji warning code 0x00000010`; `bms is not available` is the defensive null-client case) but still 200. `warningMessage` shows the LAST warning service in registration order (BMS comes after inverter), so a concurrent BMS warning hides the Anenji warning text |
 
 Route registration order matters: `/api/config/backup` is registered before `/api/config`
 because the shorter matcher is backward-compatible and would otherwise swallow it. Likewise
@@ -441,7 +456,15 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 ## Validation convention
 
 - Firmware: `pio run -e faraday` must pass; the build uses `-Wshadow` and
-  `CORE_DEBUG_LEVEL=3` (`platformio.ini`), so keep it warning-free. There is no lint/format
+  `CORE_DEBUG_LEVEL=3` (`platformio.ini`), so keep it warning-free. Exactly two warnings are
+  accepted: the pre-existing `ETH_CLK_MODE` redefinition and one internal `-Wshadow` from
+  pinned `adafruit/Adafruit NeoPixel@==1.12.3` (`Adafruit_NeoPixel::rainbow()` parameter
+  `brightness` shadows a class member, unchanged upstream through 1.15.0 so upgrading does not
+  help) — project code must stay warning-free and `-Wshadow` must not be weakened to hide
+  library warnings. A full clean rebuild additionally emits pre-existing third-party noise
+  (e.g. `CONFIG_HEAP_POISONING_LIGHT` redefinition from our own build flag across every
+  library TU, ESPAsyncWebServer `-Wshadow`, ArduinoJson deprecations) — it is library code,
+  not a project regression. There is no lint/format
   config, no test framework and no CI. BLE/Wi-Fi coexistence and the NimBLE RAM footprint are
   hardware-verified only on a real board.
 - Frontend: `cd frontend && npm run build` (`tsc --noEmit && vite build`) must pass; it writes
@@ -475,9 +498,9 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   `LED_STRIP2_PIN` all alias it. Connect **one** device at a time (DS18B20 / DHT11 / DHT21 /
   LED strip #2); there is no multiplexer.
 - **GPIO12 (`STATUS_LED_PIN`, WS2812 RGBW) and GPIO2 (`BUZZER_PIN`) are boot-strapping
-  pins.** A LED strip or buzzer load present at boot can prevent the ESP32 from starting;
-  verify the external circuit before enabling either. The only current buzzer use is the
-  150 ms boot beep.
+  pins.** The single on-board status pixel is now actively driven (health green/yellow/red),
+  so an external LED-strip load present at boot can prevent the ESP32 from starting; verify
+  the external circuit. The only current buzzer use is the 150 ms boot beep.
 - `RF433_RX_PIN` is GPIO16, adjacent to the Ethernet 50 MHz clock output on GPIO17
   (`ETH_CLOCK_GPIO17_OUT`). Verify the schematic/PCB before using RF433 and Ethernet
   together; the RF433 domain is not implemented.
@@ -558,10 +581,48 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 - `/api/config` and `/api/config/backup` only accept raw bodies (no multipart), and restore
   rejects archives whose `config.bin` version byte or CRC does not match the running
   `CURRENT_VERSION`. A restore reboots the device.
-- `healthcheck/ready` is not ready until the MQTT service has passed at least one check; with
-  no broker configured it stays 500 (early checks report
+- `healthcheck/ready` is not ready until every registered service has passed at least one
+  check; with no broker configured it stays 500 (early checks report
   `service success count less min sucess count`, later `mqtt is not connected`).
-  `/healthcheck/healty` is the liveness endpoint and is always 200.
+  `/healthcheck/healty` is the liveness endpoint and is always 200. Service order is `mqtt`,
+  meter, inverter, BMS; meter/inverter unreachability and device faults are hard failures
+  (500), BMS link/staleness is only a warning (200).
+- The pinned ed-healthcheck aggregation reports the `message` of the **last failing service
+  in registration order**, and while a failing service's fails count is ≤ 3 the JSON carries
+  the library generic `service success count less min sucess count` message — only its 4th
+  consecutive failing check (~2 s after the verdict flips) surfaces the service's own message.
+  A meter or inverter absent at boot then reports `wb-map12e not probed yet` /
+  `anenji not probed yet` until the 3rd failed probe (~10.5 s) switches it to
+  `wb-map12e is not responding` / `anenji is not responding`.
+- The WB-MAP12E driver in pinned ed-wb exposes no status/error register, so meter health only
+  checks reachability: a single `getVoltage` L1 probe every 5 s, and three consecutive failed
+  probes (including a driver-failed sentinel read) publish `wb-map12e is not responding`.
+  An Anenji `getFaultCode()` / `getWorkMode()` / `getWarningCode()` probe runs on the same 5 s
+  cadence; a non-zero fault code or `FaultMode` yields `anenji fault code 0x........`
+  (+ `, work mode = Fault`) and dominates. Register 104 (raw warning code) is a health warning
+  input — `anenji warning code 0x........` on HTTP 200, never 500; the masked warning code and
+  warning mask (registers 108/314) remain unused.
+- When an active Anenji warning and a BMS warning are both present, `/healthcheck/ready`
+  reports the BMS text because `warningMessage` comes from the last warning service in
+  registration order (BMS is registered after the inverter).
+- BMS health reads only the mutex-guarded client snapshot, never a bus: `bms: BLE stack
+  unavailable`, `bms is not connected` and `bms data is stale` (>35 s without basic info) are
+  warnings (200); a protection bitmask or any non-zero error counter is a hard failure with
+  `bms fault: <labels>` (or `name=count` pairs when the protection bitmask is zero).
+- The meter/inverter health probes take `modbusBus` with a bounded 200 ms wait and skip
+  silently on contention (the cached verdict holds until the next successful probe). The BMS
+  MAC and Anenji address apply live to polling but do **not** add or remove health services —
+  registration happens before those values are assigned, so only a reboot can change the
+  service set.
+- The status LED mirrors the same adapter verdict caches as `/healthcheck/ready` through the
+  lock-free `level()` getters and never calls `ready()` (`mqtt.ready()` has `tick()` side
+  effects; adapter probes self-throttle). MQTT disconnected or any Error-level adapter =>
+  RED; any Warning-level adapter (BMS link/staleness, Anenji warning code) => YELLOW; else
+  GREEN. Adapters that were never registered (disabled `anenjiAddress` / empty BMS MAC) are
+  `nullptr` and contribute Ok. `show()` runs only when the level changes or on first paint.
+  The pixel is driven through `Adafruit_NeoPixel`'s ESP32 RMT backend — a single-pixel
+  `show()` costs tens of µs and only runs on level change; RMT + BLE (NimBLE) coexistence and
+  the RGBW byte order (`NEO_GRBW`) are hardware-unverified.
 - PCF8574 probe failures at `0x24`/`0x22` are logged as warnings by design when no expanders
   are attached; with `0x24` missing the relay domain is disabled at boot — ventilation/light
   and generator init and handler wiring are skipped, no MQTT subscriptions or HA entities are
@@ -632,7 +693,7 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   payload bytes 14–15) and the JBD current/capacity scale (0.1 vs 0.01 depending on
   MOSFET-bit7) are ported from esphome-jbd-bms and **hardware-unverified**.
 - BMS support grew the firmware by roughly 297 KB with NimBLE-Arduino; the app slot still has
-  ~428 KB of headroom at 1,472,768 B used (77.5%). OTA and USB flashing are unaffected.
+  ~414 KB of headroom at 1,486,048 B used (78.2%). OTA and USB flashing are unaffected.
 - A v5 upgrade resets `/config.bin` (pre-v5 fails CRC/size) and rejects v4 backups — re-enter
   the BMS MAC/cell count after upgrading.
 - Library APIs change: read the checked-out sources under `.pio/libdeps/faraday/<lib>/src`

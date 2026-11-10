@@ -196,7 +196,7 @@ charging/discharging/balancing/fault и текстовые status/errors/device 
 | `RS485_RX` / `RS485_TX` | 32 / 33 | `Serial2`, скорость `RS485_SPEED` = 19200 | резерв, baud — заглушка |
 | `GSM_RX` / `GSM_TX` | 13 / 15 | `Serial1`, скорость `GSM_SPEED` = 115200 | резерв, baud — заглушка |
 | `BUZZER_PIN` | 2 | Буззер | только стартовый сигнал 2700 Гц / 150 мс |
-| `STATUS_LED_PIN` | 12 | WS2812B RGBW, лента №1 | резерв |
+| `STATUS_LED_PIN` | 12 | WS2812B RGBW, лента №1 | статус-индикатор healthcheck: зелёный — ok, жёлтый — warning, красный — error |
 
 > **Внимание:** GPIO14 — общий коннектор. `SENSOR_BUS_PIN`, `DS18B20_PIN`, `DHT_PIN` и
 > `LED_STRIP2_PIN` — это один и тот же пин; одновременно можно подключить только одно
@@ -450,7 +450,8 @@ pio run -e faraday -t uploadfs
   уже используется доменом реле (свет/вентиляция), см. «Возможности».
 - **GPIO14** (`SENSOR_BUS_PIN`, он же `DS18B20_PIN`, `DHT_PIN`, `LED_STRIP2_PIN`) —
   датчики DS18B20/DHT11/DHT21 или LED-лента №2, по одному устройству за раз.
-- **GPIO12** (`STATUS_LED_PIN`) — WS2812B RGBW, лента №1.
+- **GPIO12** (`STATUS_LED_PIN`) — WS2812B RGBW, лента №1: статус-индикатор healthcheck
+  (зелёный — ok, жёлтый — warning, красный — error).
 - **GPIO16** (`RF433_RX_PIN`) — приёмник 433 МГц; рядом тактовый выход Ethernet на GPIO17,
   требует проверки по схеме.
 - **GPIO32/33** (`RS485_RX`/`RS485_TX`, `Serial2`) — RS485, baud `19200` пока заглушка.
