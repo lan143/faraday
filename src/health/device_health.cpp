@@ -222,56 +222,12 @@ EDHealthCheck::ReadyResult Faraday::Health::BmsHealth::ready()
             || snapshot.errorCounts.dischargeUndertemperature != 0
             || snapshot.errorCounts.batteryOvervoltage != 0
             || snapshot.errorCounts.batteryUndervoltage != 0);
-    const bool fault = snapshot.hasBasicInfo
-        && (snapshot.basicInfo.protectionBitmask != 0 || countersFault);
-
-    if (fault) {
+    if (snapshot.hasBasicInfo && snapshot.basicInfo.protectionBitmask != 0) {
         std::string message = "bms fault: ";
-        if (snapshot.basicInfo.protectionBitmask != 0) {
-            char labels[352] = {0};
-            Faraday::Bms::Protocol::formatProtectionLabels(
-                snapshot.basicInfo.protectionBitmask, labels, sizeof(labels));
-            message += labels;
-        } else {
-            static const char* const names[11] = {
-                "short_circuit",
-                "charge_overcurrent",
-                "discharge_overcurrent",
-                "cell_overvoltage",
-                "cell_undervoltage",
-                "charge_overtemperature",
-                "charge_undertemperature",
-                "discharge_overtemperature",
-                "discharge_undertemperature",
-                "battery_overvoltage",
-                "battery_undervoltage",
-            };
-            const uint16_t counts[11] = {
-                snapshot.errorCounts.shortCircuit,
-                snapshot.errorCounts.chargeOvercurrent,
-                snapshot.errorCounts.dischargeOvercurrent,
-                snapshot.errorCounts.cellOvervoltage,
-                snapshot.errorCounts.cellUndervoltage,
-                snapshot.errorCounts.chargeOvertemperature,
-                snapshot.errorCounts.chargeUndertemperature,
-                snapshot.errorCounts.dischargeOvertemperature,
-                snapshot.errorCounts.dischargeUndertemperature,
-                snapshot.errorCounts.batteryOvervoltage,
-                snapshot.errorCounts.batteryUndervoltage,
-            };
-
-            bool first = true;
-            for (size_t i = 0; i < 11; ++i) {
-                if (counts[i] == 0) {
-                    continue;
-                }
-                char entry[40] = {0};
-                snprintf(entry, sizeof(entry), "%s%s=%u",
-                    first ? "" : ", ", names[i], static_cast<unsigned>(counts[i]));
-                message += entry;
-                first = false;
-            }
-        }
+        char labels[352] = {0};
+        Faraday::Bms::Protocol::formatProtectionLabels(
+            snapshot.basicInfo.protectionBitmask, labels, sizeof(labels));
+        message += labels;
 
         if (!_faultLogged) {
             _faultLogged = true;
@@ -284,6 +240,60 @@ EDHealthCheck::ReadyResult Faraday::Health::BmsHealth::ready()
     if (_faultLogged) {
         _faultLogged = false;
         LOGI("health", "bms fault cleared");
+    }
+
+    if (countersFault) {
+        static const char* const names[11] = {
+            "short_circuit",
+            "charge_overcurrent",
+            "discharge_overcurrent",
+            "cell_overvoltage",
+            "cell_undervoltage",
+            "charge_overtemperature",
+            "charge_undertemperature",
+            "discharge_overtemperature",
+            "discharge_undertemperature",
+            "battery_overvoltage",
+            "battery_undervoltage",
+        };
+        const uint16_t counts[11] = {
+            snapshot.errorCounts.shortCircuit,
+            snapshot.errorCounts.chargeOvercurrent,
+            snapshot.errorCounts.dischargeOvercurrent,
+            snapshot.errorCounts.cellOvervoltage,
+            snapshot.errorCounts.cellUndervoltage,
+            snapshot.errorCounts.chargeOvertemperature,
+            snapshot.errorCounts.chargeUndertemperature,
+            snapshot.errorCounts.dischargeOvertemperature,
+            snapshot.errorCounts.dischargeUndertemperature,
+            snapshot.errorCounts.batteryOvervoltage,
+            snapshot.errorCounts.batteryUndervoltage,
+        };
+
+        std::string message = "bms error counters (latched): ";
+        bool first = true;
+        for (size_t i = 0; i < 11; ++i) {
+            if (counts[i] == 0) {
+                continue;
+            }
+            char entry[40] = {0};
+            snprintf(entry, sizeof(entry), "%s%s=%u",
+                first ? "" : ", ", names[i], static_cast<unsigned>(counts[i]));
+            message += entry;
+            first = false;
+        }
+
+        if (!_warningLogged) {
+            _warningLogged = true;
+            LOGW("health", "%s", message.c_str());
+        }
+        _level = HealthLevel::Warning;
+        return EDHealthCheck::ReadyResult(true, message, true);
+    }
+
+    if (_warningLogged) {
+        _warningLogged = false;
+        LOGI("health", "bms error counters cleared");
     }
     _level = HealthLevel::Ok;
     return EDHealthCheck::ReadyResult(true, "");

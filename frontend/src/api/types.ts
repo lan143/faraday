@@ -190,6 +190,8 @@ export interface BmsState {
   clearPending: boolean;
   /** `null` until a clear completes, then the final outcome. */
   clearResult: 'sent' | 'acked' | 'failed' | null;
+  /** JBD app-key handshake status for the current BLE session. */
+  authState: 'not-authenticated' | 'authenticating' | 'authenticated' | 'failed';
 }
 
 /** One BLE scan hit from `GET /api/bms/scan/status`. */

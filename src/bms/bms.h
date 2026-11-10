@@ -21,8 +21,9 @@ namespace Faraday
     {
         // JBD-BMS-over-Bluetooth telemetry domain facade (automation.cpp
         // pattern): owns the Client singleton and the MQTT/HA sensor objects.
-        // Read-only except for one explicit command: clearing the BMS's latched
-        // failed-event counters (no MOSFET/balancer writes, no auth flow).
+        // Read-only telemetry plus the operator-triggered failed-event counter
+        // clear, with the JBD app-key handshake for command access; no
+        // MOSFET/balancer writes.
         // init() starts the client task; when no valid MAC is configured it
         // creates no sensors and the client stays BLE-dormant (scan only).
         void init(EDMQTT::MQTT* mqtt, EDHA::DiscoveryMgr* discoveryMgr, EDHA::Device* device, const std::string& mqttPrefix);

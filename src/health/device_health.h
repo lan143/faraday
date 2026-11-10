@@ -101,8 +101,9 @@ namespace Faraday
             std::string _message = "anenji not probed yet";
         };
 
-        // JBD BMS link/staleness warnings and protection/error-counter faults.
-        // Uses only the Client's mutex-guarded accessors; never touches a bus.
+        // JBD BMS link/staleness warnings, live protection-bitmask faults and
+        // latched error-counter warnings. Uses only the Client's mutex-guarded
+        // accessors; never touches a bus.
         class BmsHealth : public EDHealthCheck::Ready
         {
         public:
@@ -116,6 +117,7 @@ namespace Faraday
             // Not-yet-connected (or never probed) is a warning, not an error.
             HealthLevel _level = HealthLevel::Warning;
             bool _faultLogged = false;
+            bool _warningLogged = false;
         };
     }
 }

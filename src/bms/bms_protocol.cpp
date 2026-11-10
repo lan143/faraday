@@ -42,6 +42,16 @@ uint16_t Faraday::Bms::Protocol::checksum(const uint8_t* data, uint16_t len)
     return static_cast<uint16_t>(0 - sum);
 }
 
+uint8_t Faraday::Bms::Protocol::authChecksum(const uint8_t* data, uint16_t len)
+{
+    uint8_t sum = 0;
+    for (uint16_t i = 0; i < len; ++i) {
+        sum = static_cast<uint8_t>(sum + data[i]);
+    }
+
+    return sum;
+}
+
 uint16_t Faraday::Bms::Protocol::buildCommandFrame(uint8_t command, uint8_t address, uint8_t* out)
 {
     out[0] = JBD_PKT_START;
@@ -60,6 +70,96 @@ uint16_t Faraday::Bms::Protocol::buildCommandFrame(uint8_t command, uint8_t addr
 uint16_t Faraday::Bms::Protocol::buildReadFrame(uint8_t addr, uint8_t* out)
 {
     return buildCommandFrame(JBD_CMD_READ, addr, out);
+}
+
+uint8_t Faraday::Bms::Protocol::buildWriteFrame(
+    uint8_t address,
+    const uint8_t* data,
+    uint8_t dataLen,
+    uint8_t* out
+)
+{
+    if (out == nullptr || (data == nullptr && dataLen > 0)) {
+        return 0;
+    }
+
+    out[0] = JBD_PKT_START;
+    out[1] = JBD_CMD_WRITE;
+    out[2] = address;
+    out[3] = dataLen;
+    if (dataLen > 0) {
+        memcpy(&out[4], data, dataLen);
+    }
+
+    const uint16_t crc = checksum(&out[2], static_cast<uint16_t>(dataLen + 2));
+    out[4 + dataLen] = static_cast<uint8_t>(crc >> 8);
+    out[5 + dataLen] = static_cast<uint8_t>(crc & 0xFF);
+    out[6 + dataLen] = JBD_PKT_END;
+
+    return static_cast<uint8_t>(7 + dataLen);
+}
+
+uint16_t Faraday::Bms::Protocol::buildAppKeyFrame(uint8_t* out)
+{
+    out[0] = JBD_AUTH_START_0;
+    out[1] = JBD_AUTH_START_1;
+    out[2] = JBD_AUTH_CMD_APP_KEY;
+    out[3] = 0x06;
+    for (uint8_t i = 0; i < 6; ++i) {
+        out[4 + i] = 0x30;  // ASCII "000000"
+    }
+    out[10] = authChecksum(&out[2], 8);
+
+    return 11;
+}
+
+uint16_t Faraday::Bms::Protocol::buildRandomRequestFrame(uint8_t* out)
+{
+    out[0] = JBD_AUTH_START_0;
+    out[1] = JBD_AUTH_START_1;
+    out[2] = JBD_AUTH_CMD_GET_RANDOM;
+    out[3] = 0x00;
+    out[4] = authChecksum(&out[2], 2);
+
+    return 5;
+}
+
+uint16_t Faraday::Bms::Protocol::buildUserPasswordFrame(
+    const uint8_t mac[6],
+    const uint8_t password[6],
+    uint8_t randomByte,
+    uint8_t* out
+)
+{
+    out[0] = JBD_AUTH_START_0;
+    out[1] = JBD_AUTH_START_1;
+    out[2] = JBD_AUTH_CMD_PASSWORD;
+    out[3] = 0x06;
+    for (uint8_t i = 0; i < 6; ++i) {
+        out[4 + i] = static_cast<uint8_t>(((mac[i] ^ password[i]) + randomByte) & 0xFF);
+    }
+    out[10] = authChecksum(&out[2], 8);
+
+    return 11;
+}
+
+uint16_t Faraday::Bms::Protocol::buildRootPasswordFrame(
+    const uint8_t mac[6],
+    uint8_t randomByte,
+    uint8_t* out
+)
+{
+    out[0] = JBD_AUTH_START_0;
+    out[1] = JBD_AUTH_START_1;
+    out[2] = JBD_AUTH_CMD_ROOT_PASSWORD;
+    out[3] = 0x0F;
+    for (uint8_t i = 0; i < 15; ++i) {
+        const uint8_t macByte = i < 6 ? mac[i] : 0x00;
+        out[4 + i] = static_cast<uint8_t>(((macByte ^ JBD_ROOT_PASSWORD[i]) + randomByte) & 0xFF);
+    }
+    out[19] = authChecksum(&out[2], 17);
+
+    return 20;
 }
 
 void Faraday::Bms::Protocol::FrameAssembler::onNotification(const uint8_t* data, uint16_t len)
@@ -115,7 +215,6 @@ bool Faraday::Bms::Protocol::FrameAssembler::tryComplete()
     );
     const uint16_t crcActual = checksum(&_buf[2], static_cast<uint16_t>(_buf[3] + 2));
     const bool valid = _buf[expected - 1] == JBD_PKT_END
-        && _buf[2] == 0x00
         && crcExpected == crcActual;
 
     if (valid) {
@@ -141,6 +240,27 @@ bool Faraday::Bms::Protocol::FrameAssembler::takeFrame(
         return false;
     }
 
+    // Telemetry reads only ever see OK frames. A validated error-status frame
+    // is consumed/discarded here, matching the previous assembler behaviour.
+    if (_status != 0x00) {
+        _hasFrame = false;
+        return false;
+    }
+
+    return takeFrameAllowError(function, status, data, len);
+}
+
+bool Faraday::Bms::Protocol::FrameAssembler::takeFrameAllowError(
+    uint8_t& function,
+    uint8_t& status,
+    const uint8_t*& data,
+    uint16_t& len
+)
+{
+    if (!_hasFrame) {
+        return false;
+    }
+
     function = _function;
     status = _status;
     data = _buf + 4;
@@ -156,6 +276,118 @@ void Faraday::Bms::Protocol::FrameAssembler::reset()
     _hasFrame = false;
     _function = 0;
     _status = 0;
+    _dataLen = 0;
+}
+
+void Faraday::Bms::Protocol::AuthAssembler::onNotification(const uint8_t* data, uint16_t len)
+{
+    if (data == nullptr || len == 0 || _hasFrame) {
+        return;
+    }
+
+    for (uint16_t i = 0; i < len; ++i) {
+        if (_len < kBufferSize) {
+            _buf[_len++] = data[i];
+        } else {
+            // Full buffer without a complete frame: drop the oldest byte.
+            memmove(_buf, _buf + 1, kBufferSize - 1);
+            _len = kBufferSize - 1;
+            _buf[_len++] = data[i];
+        }
+
+        if (tryComplete()) {
+            return;
+        }
+    }
+}
+
+bool Faraday::Bms::Protocol::AuthAssembler::tryComplete()
+{
+    uint16_t start = 0;
+    while (start + 1 < _len
+        && !(_buf[start] == JBD_AUTH_START_0 && _buf[start + 1] == JBD_AUTH_START_1)) {
+        ++start;
+    }
+
+    if (start > 0) {
+        memmove(_buf, _buf + start, static_cast<size_t>(_len - start));
+        _len = static_cast<uint16_t>(_len - start);
+    }
+
+    if (_len < 2) {
+        if (_len == 1 && _buf[0] != JBD_AUTH_START_0) {
+            _len = 0;
+        }
+        return false;
+    }
+
+    if (_buf[0] != JBD_AUTH_START_0 || _buf[1] != JBD_AUTH_START_1) {
+        if (_buf[_len - 1] == JBD_AUTH_START_0) {
+            _buf[0] = JBD_AUTH_START_0;
+            _len = 1;
+        } else {
+            _len = 0;
+        }
+        return false;
+    }
+
+    if (_len < 4) {
+        return false;
+    }
+
+    const uint16_t dataLen = _buf[3];
+    const uint16_t expected = static_cast<uint16_t>(4 + dataLen + 1);
+    if (expected > kBufferSize) {
+        memmove(_buf, _buf + 1, static_cast<size_t>(_len - 1));
+        --_len;
+        return tryComplete();
+    }
+
+    if (_len < expected) {
+        return false;
+    }
+
+    if (authChecksum(&_buf[2], static_cast<uint16_t>(dataLen + 2)) != _buf[expected - 1]) {
+        // Corrupt frame: drop the prefix byte and resync on the next FF AA.
+        memmove(_buf, _buf + 1, static_cast<size_t>(_len - 1));
+        --_len;
+        return tryComplete();
+    }
+
+    _command = _buf[2];
+    _dataLen = static_cast<uint8_t>(dataLen);
+    memcpy(_data, &_buf[4], dataLen);
+    _hasFrame = true;
+
+    memmove(_buf, _buf + expected, static_cast<size_t>(_len - expected));
+    _len = static_cast<uint16_t>(_len - expected);
+
+    return true;
+}
+
+bool Faraday::Bms::Protocol::AuthAssembler::takeFrame(
+    uint8_t& command,
+    const uint8_t*& data,
+    uint8_t& dataLen
+)
+{
+    if (!_hasFrame) {
+        return false;
+    }
+
+    command = _command;
+    data = _data;
+    dataLen = _dataLen;
+    _hasFrame = false;
+
+    return true;
+}
+
+void Faraday::Bms::Protocol::AuthAssembler::reset()
+{
+    _len = 0;
+    _hasFrame = false;
+    _command = 0;
     _dataLen = 0;
 }
 

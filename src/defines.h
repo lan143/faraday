@@ -58,6 +58,11 @@
 #define BMS_DEFAULT_CELLS 12
 #define BMS_POLL_INTERVAL_MS 10000
 #define BMS_RESPONSE_TIMEOUT_MS 2500
+// First app-key response wait. Packs that do not speak the FF AA dialect are
+// detected here and remembered as unsupported for that address.
+#define BMS_AUTH_APPKEY_TIMEOUT_MS 3000
+// One later password/root handshake step (request -> response).
+#define BMS_AUTH_STEP_TIMEOUT_MS 10000
 #define BMS_RECONNECT_MIN_MS 5000
 #define BMS_RECONNECT_MAX_MS 60000
 // NimBLE 1.4.x scan start() takes the duration in SECONDS, not milliseconds.

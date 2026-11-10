@@ -1073,8 +1073,8 @@ void Handler::registerControlHandlers()
 // swVersion, mosfetBitmask, protectionBitmask, balancerBitmask,
 // minCellVoltage, maxCellVoltage, avgCellVoltage, deltaCellVoltage,
 // temperatures, cells, errorCounts, clearGeneration, clearPending,
-// clearResult}. Sensor/cell fields come from one snapshot copy, while
-// clearGeneration/clearPending/clearResult come from their own
+// clearResult, authState}. Sensor/cell fields come from one snapshot copy,
+// while clearGeneration/clearPending/clearResult/authState come from their own
 // mutex-guarded client getters.
 void Handler::sendBmsState(AsyncWebServerRequest* request, int status)
 {
@@ -1085,6 +1085,7 @@ void Handler::sendBmsState(AsyncWebServerRequest* request, int status)
     uint8_t clearGeneration = 0;
     bool clearPending = false;
     char clearResult[8] = {0};
+    char authState[24] = "not-authenticated";
     Faraday::Bms::BmsSnapshot snapshot;
 
     if (_bms != nullptr) {
@@ -1094,6 +1095,7 @@ void Handler::sendBmsState(AsyncWebServerRequest* request, int status)
         clearGeneration = _bms->clearGeneration();
         clearPending = _bms->clearPending();
         _bms->clearResult(clearResult, sizeof(clearResult));
+        _bms->authState(authState, sizeof(authState));
         _bms->copySnapshot(snapshot);
     }
 
@@ -1226,6 +1228,7 @@ void Handler::sendBmsState(AsyncWebServerRequest* request, int status)
         } else {
             entity["clearResult"] = clearResult;
         }
+        entity["authState"] = authState;
     });
 
     response->write(payload.c_str());

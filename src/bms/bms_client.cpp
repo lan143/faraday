@@ -45,6 +45,14 @@ struct Faraday::Bms::Client::Impl
         ConfigChanged,
     };
 
+    enum class AuthState
+    {
+        NotAuthenticated,
+        Authenticating,
+        Authenticated,
+        Failed,
+    };
+
     struct SessionOutcome
     {
         bool configChanged = false;
@@ -90,6 +98,9 @@ struct Faraday::Bms::Client::Impl
     // raw field as a lock-free fast path (single writer task — do not take
     // lock() for those reads, keeping lock() calls strictly paired).
     bool bleUnavailable = false;
+    // Guarded by owner->_mutex: written only by the bms task via
+    // setAuthState(); the task reads its own raw value as a fast path.
+    AuthState authState = AuthState::NotAuthenticated;
 
     // Scan completion edge set by scanCompleteShim() on the NimBLE host task.
     // Written from the host task, read by the bms task; the bms task also runs
@@ -106,6 +117,19 @@ struct Faraday::Bms::Client::Impl
     NimBLEClient* bleClient = nullptr;
     NimBLERemoteCharacteristic* cmdChar = nullptr;
     Protocol::FrameAssembler assembler;
+    Protocol::AuthAssembler authAssembler;
+    uint8_t authRandom = 0;
+    // Set when the app-key step gets no response at all. Task-only state, but
+    // Client::setAddress() clears it under the mutex when the address changes.
+    bool authUnsupported = false;
+    // True once a factory-enter frame was acknowledged with status 0x00 (the
+    // pack is now in factory mode) and no exit frame has been written
+    // successfully since. Task-only: deliberately survives plain reconnects so
+    // the next session can un-strand the pack; Client::start() resets it to
+    // false at boot only (never on a reconnect).
+    bool factoryExitPending = false;
+    // Throttle for the all-zero basic-info warning (at most one per session).
+    bool warnedAllZeroBasic = false;
     int64_t lastHeapWarnAtUs = 0;
 
     // Pure deferral: never marks bleUnavailable, so a later boot state with more
@@ -176,6 +200,35 @@ struct Faraday::Bms::Client::Impl
         owner->unlock();
     }
 
+    void setAuthState(AuthState value)
+    {
+        owner->lock();
+        authState = value;
+        owner->unlock();
+    }
+
+    static bool parseMacBytes(const char* text, uint8_t out[6])
+    {
+        unsigned int bytes[6] = {0};
+        if (sscanf(
+                text,
+                "%2x:%2x:%2x:%2x:%2x:%2x",
+                &bytes[0],
+                &bytes[1],
+                &bytes[2],
+                &bytes[3],
+                &bytes[4],
+                &bytes[5]
+            ) != 6) {
+            return false;
+        }
+
+        for (uint8_t i = 0; i < 6; ++i) {
+            out[i] = static_cast<uint8_t>(bytes[i]);
+        }
+        return true;
+    }
+
     // bleUnavailable is read cross-task by Client::bleUnavailable() under the
     // owner mutex, so every task-side write must go through here.
     void markBleUnavailable()
@@ -220,8 +273,10 @@ struct Faraday::Bms::Client::Impl
 
         cmdChar = nullptr;
         assembler.reset();
+        authAssembler.reset();
         drainRx();
         updateConnected(false);
+        setAuthState(AuthState::NotAuthenticated);
 
         // A clear that never reached the wire fails; do not let it stay
         // pending across sessions (future requests would be refused forever).
@@ -233,14 +288,11 @@ struct Faraday::Bms::Client::Impl
         }
     }
 
-    bool sendRead(uint8_t addressByte)
+    bool writeFrame(const uint8_t* frame, uint16_t frameLen)
     {
-        if (cmdChar == nullptr) {
+        if (cmdChar == nullptr || frame == nullptr || frameLen == 0) {
             return false;
         }
-
-        uint8_t frame[7] = {0};
-        const uint16_t frameLen = Protocol::buildReadFrame(addressByte, frame);
 
         // Write-without-response works on the JBD characteristic; fall back to
         // write-with-response when the peer requires an acknowledgement.
@@ -252,6 +304,43 @@ struct Faraday::Bms::Client::Impl
         return ok;
     }
 
+    bool sendRead(uint8_t addressByte)
+    {
+        uint8_t frame[7] = {0};
+        const uint16_t frameLen = Protocol::buildReadFrame(addressByte, frame);
+        return writeFrame(frame, frameLen);
+    }
+
+    bool sendFactoryFrame(uint8_t registerAddress, const uint8_t* payload, uint8_t payloadLen)
+    {
+        uint8_t frame[16] = {0};
+        const uint16_t frameLen = Protocol::buildWriteFrame(
+            registerAddress, payload, payloadLen, frame);
+        return writeFrame(frame, frameLen);
+    }
+
+    // Responses arrive on the notify characteristic (0xFF01); commands are
+    // written to 0xFF02. Auth (FF AA) and DD frames interleave on that single
+    // notification path, so route by whichever assembler already holds a
+    // partial frame first (a split frame is never misrouted), otherwise the
+    // FF AA prefix picks auth and everything else the DD assembler.
+    void routeChunk(const RxChunk& chunk)
+    {
+        const bool authPrefix =
+            chunk.len >= 2
+            && chunk.data[0] == Protocol::JBD_AUTH_START_0
+            && chunk.data[1] == Protocol::JBD_AUTH_START_1;
+        if (authAssembler.hasPartial()) {
+            authAssembler.onNotification(chunk.data, chunk.len);
+        } else if (assembler.hasPartial()) {
+            assembler.onNotification(chunk.data, chunk.len);
+        } else if (authPrefix) {
+            authAssembler.onNotification(chunk.data, chunk.len);
+        } else {
+            assembler.onNotification(chunk.data, chunk.len);
+        }
+    }
+
     TxResult waitForFrame(uint8_t expectedFunction, const uint8_t*& data, uint16_t& len, uint32_t generation)
     {
         const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(BMS_RESPONSE_TIMEOUT_MS) * 1000;
@@ -260,7 +349,7 @@ struct Faraday::Bms::Client::Impl
             RxChunk chunk;
 
             while (xQueueReceive(rxQueue, &chunk, 0) == pdTRUE) {
-                assembler.onNotification(chunk.data, chunk.len);
+                routeChunk(chunk);
 
                 if (assembler.hasFrame()) {
                     uint8_t function = 0;
@@ -290,9 +379,15 @@ struct Faraday::Bms::Client::Impl
         }
     }
 
-    // Ack shape for the clear command is unknown: JBD may answer with its
-    // function byte or stay silent, so accept any validated (status 0) frame.
-    TxResult waitForAnyFrame(const uint8_t*& data, uint16_t& len, uint32_t generation)
+    // Factory-mode responses may carry an error status (e.g. 0x80 when the
+    // pack is not in factory mode); surface the validated frame either way.
+    TxResult waitForFactoryFrame(
+        uint8_t& function,
+        uint8_t& status,
+        const uint8_t*& data,
+        uint16_t& len,
+        uint32_t generation
+    )
     {
         const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(BMS_RESPONSE_TIMEOUT_MS) * 1000;
 
@@ -300,15 +395,18 @@ struct Faraday::Bms::Client::Impl
             RxChunk chunk;
 
             while (xQueueReceive(rxQueue, &chunk, 0) == pdTRUE) {
-                assembler.onNotification(chunk.data, chunk.len);
+                routeChunk(chunk);
 
                 if (assembler.hasFrame()) {
-                    uint8_t function = 0;
-                    uint8_t status = 0;
+                    uint8_t frameFunction = 0;
+                    uint8_t frameStatus = 0;
                     const uint8_t* frameData = nullptr;
                     uint16_t frameLen = 0;
 
-                    if (assembler.takeFrame(function, status, frameData, frameLen)) {
+                    if (assembler.takeFrameAllowError(
+                            frameFunction, frameStatus, frameData, frameLen)) {
+                        function = frameFunction;
+                        status = frameStatus;
                         data = frameData;
                         len = frameLen;
                         return TxResult::Ok;
@@ -332,6 +430,266 @@ struct Faraday::Bms::Client::Impl
             const uint32_t ticks = static_cast<uint32_t>(remain / 1000) + 1;
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ticks));
         }
+    }
+
+    void authTimeout()
+    {
+        LOGW("bms", "auth: timeout");
+        setAuthState(AuthState::Failed);
+    }
+
+    void authWriteFailed()
+    {
+        LOGW("bms", "auth: write failed");
+        setAuthState(AuthState::Failed);
+    }
+
+    void authShortResponse()
+    {
+        LOGW("bms", "auth: response too short");
+        setAuthState(AuthState::Failed);
+    }
+
+    void authRejected(uint8_t command, uint8_t code)
+    {
+        LOGW(
+            "bms",
+            "auth: command 0x%02X rejected code 0x%02X",
+            (unsigned)command,
+            (unsigned)code
+        );
+        setAuthState(AuthState::Failed);
+    }
+
+    TxResult waitAuthResponse(
+        uint8_t expectedCommand,
+        const uint8_t*& data,
+        uint8_t& dataLen,
+        uint32_t generation,
+        uint32_t timeoutMs
+    )
+    {
+        const int64_t deadline =
+            esp_timer_get_time() + static_cast<int64_t>(timeoutMs) * 1000;
+
+        for (;;) {
+            uint8_t command = 0;
+            uint8_t frameLen = 0;
+            const uint8_t* frameData = nullptr;
+            if (authAssembler.takeFrame(command, frameData, frameLen)) {
+                if (command == expectedCommand) {
+                    data = frameData;
+                    dataLen = frameLen;
+                    return TxResult::Ok;
+                }
+                // Unsolicited/unrelated auth frame: ignore and keep waiting.
+                continue;
+            }
+
+            RxChunk chunk;
+            while (xQueueReceive(rxQueue, &chunk, 0) == pdTRUE) {
+                routeChunk(chunk);
+                if (authAssembler.hasFrame()) {
+                    break;
+                }
+            }
+            if (authAssembler.hasFrame()) {
+                continue;
+            }
+
+            if (bleClient == nullptr || !bleClient->isConnected()) {
+                return TxResult::ConfigChanged;
+            }
+            if (configChanged(generation)) {
+                return TxResult::ConfigChanged;
+            }
+
+            const int64_t remain = deadline - esp_timer_get_time();
+            if (remain <= 0) {
+                return TxResult::Timeout;
+            }
+
+            const uint32_t ticks = static_cast<uint32_t>(remain / 1000) + 1;
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ticks));
+        }
+    }
+
+    TxResult performAuth(const uint8_t mac[6], uint32_t generation)
+    {
+        if (authUnsupported) {
+            // The pack ignored the app-key dialect on an earlier connection:
+            // skip the handshake (and its timeout) until the address changes.
+            setAuthState(AuthState::Failed);
+            return TxResult::Ok;
+        }
+
+        if (cmdChar == nullptr) {
+            setAuthState(AuthState::Failed);
+            return TxResult::Ok;
+        }
+
+        authAssembler.reset();
+        setAuthState(AuthState::Authenticating);
+
+        uint8_t frame[20] = {0};
+        const uint8_t* data = nullptr;
+        uint8_t dataLen = 0;
+
+        uint16_t frameLen = Protocol::buildAppKeyFrame(frame);
+        if (!writeFrame(frame, frameLen)) {
+            authWriteFailed();
+            return TxResult::Ok;
+        }
+        LOGI("bms", "auth: app key sent");
+
+        TxResult result = waitAuthResponse(
+            Protocol::JBD_AUTH_CMD_APP_KEY,
+            data,
+            dataLen,
+            generation,
+            BMS_AUTH_APPKEY_TIMEOUT_MS
+        );
+        if (result == TxResult::ConfigChanged) {
+            return result;
+        }
+        if (result == TxResult::Timeout) {
+            // No frame at all: this pack does not speak the FF AA dialect.
+            authUnsupported = true;
+            setAuthState(AuthState::Failed);
+            LOGW(
+                "bms",
+                "auth: no response to app key, skipping the handshake for this address"
+            );
+            return TxResult::Ok;
+        }
+        if (dataLen < 1) {
+            authShortResponse();
+            return TxResult::Ok;
+        }
+
+        const uint8_t appKeyCode = data[0];
+        if (appKeyCode == 0x02) {
+            setAuthState(AuthState::Authenticated);
+            LOGI("bms", "auth: no password required");
+            return TxResult::Ok;
+        }
+        if (appKeyCode != 0x00) {
+            authRejected(Protocol::JBD_AUTH_CMD_APP_KEY, appKeyCode);
+            return TxResult::Ok;
+        }
+
+        // Password required: fetch a random byte for the user password.
+        frameLen = Protocol::buildRandomRequestFrame(frame);
+        if (!writeFrame(frame, frameLen)) {
+            authWriteFailed();
+            return TxResult::Ok;
+        }
+        result = waitAuthResponse(
+            Protocol::JBD_AUTH_CMD_GET_RANDOM,
+            data,
+            dataLen,
+            generation,
+            BMS_AUTH_STEP_TIMEOUT_MS
+        );
+        if (result == TxResult::ConfigChanged) {
+            return result;
+        }
+        if (result == TxResult::Timeout) {
+            authTimeout();
+            return TxResult::Ok;
+        }
+        if (dataLen < 1) {
+            authShortResponse();
+            return TxResult::Ok;
+        }
+        authRandom = data[0];
+
+        const uint8_t password[6] = {'1', '2', '3', '1', '2', '3'};
+        frameLen = Protocol::buildUserPasswordFrame(mac, password, authRandom, frame);
+        if (!writeFrame(frame, frameLen)) {
+            authWriteFailed();
+            return TxResult::Ok;
+        }
+        result = waitAuthResponse(
+            Protocol::JBD_AUTH_CMD_PASSWORD,
+            data,
+            dataLen,
+            generation,
+            BMS_AUTH_STEP_TIMEOUT_MS
+        );
+        if (result == TxResult::ConfigChanged) {
+            return result;
+        }
+        if (result == TxResult::Timeout) {
+            authTimeout();
+            return TxResult::Ok;
+        }
+        if (dataLen < 1) {
+            authShortResponse();
+            return TxResult::Ok;
+        }
+        if (data[0] != 0x00) {
+            authRejected(Protocol::JBD_AUTH_CMD_PASSWORD, data[0]);
+            return TxResult::Ok;
+        }
+
+        // Fetch a fresh random byte for the root password.
+        frameLen = Protocol::buildRandomRequestFrame(frame);
+        if (!writeFrame(frame, frameLen)) {
+            authWriteFailed();
+            return TxResult::Ok;
+        }
+        result = waitAuthResponse(
+            Protocol::JBD_AUTH_CMD_GET_RANDOM,
+            data,
+            dataLen,
+            generation,
+            BMS_AUTH_STEP_TIMEOUT_MS
+        );
+        if (result == TxResult::ConfigChanged) {
+            return result;
+        }
+        if (result == TxResult::Timeout) {
+            authTimeout();
+            return TxResult::Ok;
+        }
+        if (dataLen < 1) {
+            authShortResponse();
+            return TxResult::Ok;
+        }
+        authRandom = data[0];
+
+        frameLen = Protocol::buildRootPasswordFrame(mac, authRandom, frame);
+        if (!writeFrame(frame, frameLen)) {
+            authWriteFailed();
+            return TxResult::Ok;
+        }
+        result = waitAuthResponse(
+            Protocol::JBD_AUTH_CMD_ROOT_PASSWORD,
+            data,
+            dataLen,
+            generation,
+            BMS_AUTH_STEP_TIMEOUT_MS
+        );
+        if (result == TxResult::ConfigChanged) {
+            return result;
+        }
+        if (result == TxResult::Timeout) {
+            authTimeout();
+            return TxResult::Ok;
+        }
+        if (dataLen < 1) {
+            authShortResponse();
+            return TxResult::Ok;
+        }
+        if (data[0] != 0x00) {
+            authRejected(Protocol::JBD_AUTH_CMD_ROOT_PASSWORD, data[0]);
+            return TxResult::Ok;
+        }
+
+        setAuthState(AuthState::Authenticated);
+        LOGI("bms", "auth: authenticated");
+        return TxResult::Ok;
     }
 
     void finishClear(const char* result, bool zeroCounters)
@@ -358,41 +716,157 @@ struct Faraday::Bms::Client::Impl
 
     void executeClear(uint8_t requestGeneration, uint32_t generation)
     {
-        if (bleClient == nullptr || !bleClient->isConnected() || cmdChar == nullptr) {
+        if (configChanged(generation)
+            || bleClient == nullptr
+            || !bleClient->isConnected()
+            || cmdChar == nullptr) {
             finishClear("failed", false);
             return;
         }
 
-        uint8_t frame[7] = {0};
-        const uint16_t frameLen = Protocol::buildCommandFrame(
-            Protocol::JBD_CMD_CLEAR_ERRORS,
-            Protocol::JBD_ADDR_CLEAR_ERRORS,
-            frame
+        // Enter factory/EEPROM mode (register 0x00 <- 0x5678).
+        if (!sendFactoryFrame(
+                Protocol::JBD_ADDR_FACTORY_ENTER,
+                Protocol::JBD_FACTORY_ENTER_DATA,
+                sizeof(Protocol::JBD_FACTORY_ENTER_DATA))) {
+            finishClear("failed", false);
+            return;
+        }
+
+        LOGI(
+            "bms",
+            "sent factory enter for counter clear (generation %u)",
+            (unsigned)requestGeneration
         );
 
-        // Same write pattern as sendRead(): no-response first, then with-response.
-        bool written = cmdChar->writeValue(frame, frameLen, false);
-        if (!written) {
-            written = cmdChar->writeValue(frame, frameLen, true);
-        }
+        uint8_t function = 0;
+        uint8_t status = 0;
+        const uint8_t* data = nullptr;
+        uint16_t len = 0;
 
-        if (!written || !bleClient->isConnected()) {
+        TxResult result = waitForFactoryFrame(function, status, data, len, generation);
+        if (result == TxResult::ConfigChanged) {
+            // Only when the enter had already been acknowledged
+            // (factoryExitPending is set solely after status 0x00) may the pack
+            // actually be in factory mode and need the targeted warning; an
+            // enter that was never acknowledged keeps the generic failure.
+            if (factoryExitPending) {
+                LOGW(
+                    "bms",
+                    "clear: session lost in factory mode; the pack may need a power cycle"
+                );
+            }
+            finishClear("failed", false);
+            return;
+        }
+        if (result == TxResult::Timeout) {
+            LOGW("bms", "clear: no response to factory enter");
             finishClear("failed", false);
             return;
         }
 
-        LOGI("bms", "sent counter clear command (generation %u)", (unsigned)requestGeneration);
+        LOGI(
+            "bms",
+            "clear: factory enter response function 0x%02X len %u status 0x%02X",
+            (unsigned)function,
+            (unsigned)len,
+            (unsigned)status
+        );
 
-        const uint8_t* data = nullptr;
-        uint16_t len = 0;
-        const TxResult result = waitForAnyFrame(data, len, generation);
+        if (status != 0x00) {
+            LOGW("bms", "clear: factory enter status 0x%02X", (unsigned)status);
+            finishClear("failed", false);
+            return;
+        }
 
+        // The enter is acknowledged: the pack is in factory mode now. Remember
+        // it until an exit frame is written, so an interrupted sequence is
+        // retried at the start of the next session instead of stranding the
+        // pack (this flag is never reset by a plain reconnect).
+        factoryExitPending = true;
+
+        // Mode switch settle time; still inside the bms task.
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        // If the session/config changed after a confirmed enter, leave factory
+        // mode once if the link is still there; otherwise the pack may be
+        // stranded in EEPROM mode.
+        if (configChanged(generation)
+            || bleClient == nullptr
+            || !bleClient->isConnected()
+            || cmdChar == nullptr) {
+            if (bleClient != nullptr && bleClient->isConnected() && cmdChar != nullptr) {
+                if (sendFactoryFrame(
+                        Protocol::JBD_ADDR_FACTORY_EXIT,
+                        Protocol::JBD_FACTORY_EXIT_CLEAR_DATA,
+                        sizeof(Protocol::JBD_FACTORY_EXIT_CLEAR_DATA))) {
+                    // Exit frame written: no longer stranded. A failed write
+                    // keeps the flag so the next connection retries it.
+                    factoryExitPending = false;
+                }
+            } else {
+                LOGW(
+                    "bms",
+                    "clear: session lost in factory mode; the pack may need a power cycle"
+                );
+            }
+            finishClear("failed", false);
+            return;
+        }
+
+        // Exit factory mode with the counter clear (register 0x01 <- 0x2828).
+        if (!sendFactoryFrame(
+                Protocol::JBD_ADDR_FACTORY_EXIT,
+                Protocol::JBD_FACTORY_EXIT_CLEAR_DATA,
+                sizeof(Protocol::JBD_FACTORY_EXIT_CLEAR_DATA))) {
+            if (bleClient == nullptr || !bleClient->isConnected()) {
+                LOGW(
+                    "bms",
+                    "clear: session lost in factory mode; the pack may need a power cycle"
+                );
+            }
+            // The exit write failed: keep factoryExitPending set so the next
+            // connection retries the exit frame.
+            finishClear("failed", false);
+            return;
+        }
+
+        // Exit frame on the wire (write succeeded): the pack is un-stranded
+        // even if the response below never arrives or the session drops.
+        factoryExitPending = false;
+
+        LOGI(
+            "bms",
+            "sent factory exit/counter clear (generation %u)",
+            (unsigned)requestGeneration
+        );
+
+        result = waitForFactoryFrame(function, status, data, len, generation);
         if (result == TxResult::ConfigChanged) {
             finishClear("failed", false);
             return;
         }
+        if (result == TxResult::Timeout) {
+            // The exit write was sent; the next 0xAA poll shows the truth.
+            finishClear("sent", true);
+            return;
+        }
 
-        finishClear(result == TxResult::Ok ? "acked" : "sent", true);
+        LOGI(
+            "bms",
+            "clear: factory exit response function 0x%02X len %u status 0x%02X",
+            (unsigned)function,
+            (unsigned)len,
+            (unsigned)status
+        );
+
+        if (status != 0x00) {
+            LOGW("bms", "clear: factory exit status 0x%02X", (unsigned)status);
+            finishClear("failed", false);
+            return;
+        }
+
+        finishClear("acked", true);
     }
 
     TxResult readRequest(uint8_t addressByte, const uint8_t*& data, uint16_t& len, uint32_t generation)
@@ -410,9 +884,22 @@ struct Faraday::Bms::Client::Impl
 
     void applyBasicInfo(const BmsBasicInfo& info, const BmsCells* cells, const BmsErrorCounts* errors, bool hasBasic)
     {
+        // In factory mode register 0x03 answers zeros; committing them would
+        // publish SOC 0 % / 0 V to HA. Reject only this parsed basic frame
+        // (cells and error counts still apply) and warn at most once per
+        // connection.
+        const bool zeroBasic = hasBasic && info.totalVoltage <= 0.0f && info.soc == 0.0f;
+        if (zeroBasic) {
+            hasBasic = false;
+            if (!warnedAllZeroBasic) {
+                warnedAllZeroBasic = true;
+                LOGW("bms", "ignoring all-zero basic info (pack may be in factory mode)");
+            }
+        }
+
         owner->lock();
 
-        if (hasBasic || cells != nullptr) {
+        if ((hasBasic || cells != nullptr) && !zeroBasic) {
             snapshot.basicInfo = info;
         }
         if (hasBasic) {
@@ -438,6 +925,7 @@ struct Faraday::Bms::Client::Impl
 
         assembler.reset();
         drainRx();
+        warnedAllZeroBasic = false;
 
         if (bleClient == nullptr) {
             bleClient = NimBLEDevice::createClient();
@@ -525,6 +1013,74 @@ struct Faraday::Bms::Client::Impl
             disconnect();
             outcome.configChanged = true;
             return outcome;
+        }
+
+        // JBD packs may accept reads without auth but ignore commands until the
+        // app-key handshake completes. Failure only marks the auth state; reads
+        // and the clear attempt continue either way.
+        uint8_t macBytes[6] = {0};
+        if (parseMacBytes(mac, macBytes)) {
+            const TxResult authResult = performAuth(macBytes, generation);
+            if (authResult == TxResult::ConfigChanged) {
+                disconnect();
+                outcome.configChanged = true;
+                return outcome;
+            }
+        } else {
+            setAuthState(AuthState::Failed);
+            LOGW("bms", "auth: invalid MAC address");
+        }
+
+        // Drop any DD/auth frames that arrived while the handshake ran.
+        authAssembler.reset();
+        assembler.reset();
+
+        // Un-strand recovery: a previous clear that was interrupted after its
+        // enter was acknowledged left the pack in factory mode. Retry the EXIT
+        // frame once at the start of this session; the enter frame is never
+        // sent from this path.
+        if (factoryExitPending) {
+            const bool exitWritten = sendFactoryFrame(
+                Protocol::JBD_ADDR_FACTORY_EXIT,
+                Protocol::JBD_FACTORY_EXIT_CLEAR_DATA,
+                sizeof(Protocol::JBD_FACTORY_EXIT_CLEAR_DATA));
+
+            if (exitWritten) {
+                uint8_t exitFunction = 0;
+                uint8_t exitStatus = 0;
+                const uint8_t* exitData = nullptr;
+                uint16_t exitLen = 0;
+                const TxResult exitResult = waitForFactoryFrame(
+                    exitFunction,
+                    exitStatus,
+                    exitData,
+                    exitLen,
+                    generation);
+
+                if (exitResult == TxResult::Ok) {
+                    if (exitStatus == 0x00) {
+                        LOGI(
+                            "bms",
+                            "clear: factory exit retry status 0x%02X",
+                            (unsigned)exitStatus);
+                    } else {
+                        // e.g. 0x80 = the pack is not in factory mode; either
+                        // way the exit frame was delivered, so the flag goes.
+                        LOGW(
+                            "bms",
+                            "clear: factory exit retry status 0x%02X",
+                            (unsigned)exitStatus);
+                    }
+                } else {
+                    // The exit frame is on the wire; the next 0xAA poll (or a
+                    // status-0x80 enter on a later clear) shows the truth.
+                    LOGI("bms", "clear: factory exit retry sent");
+                }
+                factoryExitPending = false;
+            } else {
+                // Keep the flag set so the next connection retries the exit.
+                LOGW("bms", "clear: factory exit retry write failed");
+            }
         }
 
         // Device model is read once per connection, right after subscribe.
@@ -825,6 +1381,8 @@ bool Faraday::Bms::Client::start()
     _impl = new Impl();
     _impl->owner = this;
     _impl->cellCount = BMS_DEFAULT_CELLS;
+    _impl->authUnsupported = false;
+    _impl->factoryExitPending = false;
     _impl->rxQueue = xQueueCreate(8, sizeof(Impl::RxChunk));
 
     if (_impl->rxQueue == nullptr) {
@@ -974,6 +1532,9 @@ void Faraday::Bms::Client::setAddress(const char* macOrNull)
     if (changed) {
         memcpy(_impl->address, normalized, sizeof(_impl->address));
         ++_impl->configGeneration;
+        // The unsupported-auth verdict is per address; a new target may speak
+        // the FF AA dialect.
+        _impl->authUnsupported = false;
     }
     const TaskHandle_t task = _impl->task;
     unlock();
@@ -1188,6 +1749,37 @@ bool Faraday::Bms::Client::clearResult(char* out, size_t n) const
     unlock();
 
     return hasResult;
+}
+
+bool Faraday::Bms::Client::authState(char* out, size_t n) const
+{
+    if (_impl == nullptr || out == nullptr || n == 0) {
+        return false;
+    }
+
+    Impl::AuthState state;
+    lock();
+    state = _impl->authState;
+    unlock();
+
+    const char* text = "not-authenticated";
+    switch (state) {
+        case Impl::AuthState::Authenticating:
+            text = "authenticating";
+            break;
+        case Impl::AuthState::Authenticated:
+            text = "authenticated";
+            break;
+        case Impl::AuthState::Failed:
+            text = "failed";
+            break;
+        default:
+            text = "not-authenticated";
+            break;
+    }
+
+    snprintf(out, n, "%s", text);
+    return true;
 }
 
 void Faraday::Bms::Client::lock() const

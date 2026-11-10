@@ -66,6 +66,10 @@ namespace Faraday
             // Returns true when a result string is available.
             bool clearResult(char* out, size_t n) const;
 
+            // Copies "not-authenticated", "authenticating", "authenticated" or
+            // "failed". Returns false when no state is available.
+            bool authState(char* out, size_t n) const;
+
             // Non-recursive mutex (plain xSemaphoreCreateMutex) guarding
             // snapshot/metadata: it must never be re-entered by a task that
             // already holds it (that would deadlock). Bounded discipline

@@ -76,6 +76,19 @@ function formatUptimeMs(value: number | null): string {
   return `${(value / 1000).toFixed(1)} s`;
 }
 
+function formatAuthState(state: BmsState['authState']): string {
+  switch (state) {
+    case 'authenticated':
+      return 'authenticated';
+    case 'authenticating':
+      return 'authenticating\u2026';
+    case 'failed':
+      return 'failed';
+    default:
+      return 'not-authenticated';
+  }
+}
+
 function clearResultNotice(result: BmsState['clearResult']): string {
   switch (result) {
     case 'acked':
@@ -381,7 +394,7 @@ export function BmsPage() {
     }
 
     const confirmed = window.confirm(
-      'Clear the BMS failed-event counters? This sends a write command over BLE.',
+      'Clear the BMS failed-event counters? This enters factory/EEPROM mode, writes registers 0x00/0x01 and clears the counters; the pack must have stable power throughout.',
     );
     if (!confirmed) {
       return;
@@ -455,6 +468,8 @@ export function BmsPage() {
   const errorCounts = state?.errorCounts ?? null;
   const latchedCounters =
     errorCounts !== null && ERROR_COUNTERS.some(({ key }) => errorCounts[key] > 0);
+  const clearHadNoEffect =
+    latchedCounters && state !== null && state.clearResult !== null;
   const clearDisabled =
     state === null ||
     !state.connected ||
@@ -505,6 +520,8 @@ export function BmsPage() {
           <dd>{formatBool(state?.connected ?? false)}</dd>
           <dt>Bluetooth</dt>
           <dd>{state?.bleUnavailable ? 'Unavailable' : 'Available'}</dd>
+          <dt>BLE access</dt>
+          <dd>{formatAuthState(state?.authState ?? 'not-authenticated')}</dd>
           <dt>Last frame</dt>
           <dd>{formatUptimeMs(state?.lastUpdateMs ?? null)}</dd>
           <dt>Reported cells</dt>
@@ -698,8 +715,14 @@ export function BmsPage() {
         )}
         {latchedCounters ? (
           <p class="muted">
-            These counters are latched: the BMS does not self-clear them, so a
-            historical event keeps the system not-ready until you clear it.
+            These counters are latched: the BMS does not self-clear them. They
+            are reported as a warning until cleared.
+          </p>
+        ) : null}
+        {clearHadNoEffect ? (
+          <p class="muted">
+            The last clear command had no effect on this BMS &mdash; these counters
+            are latched historical events; the system treats them as a warning.
           </p>
         ) : null}
         <div class="form-actions">
