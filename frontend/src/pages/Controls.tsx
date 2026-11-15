@@ -7,14 +7,14 @@ import { Card } from '../components/Card';
 import { Toggle } from '../components/Toggle';
 
 /**
- * Controls tab: on/off switches for the ventilation, light and generator
- * changeover relays. `GET /api/controls` returns the live state; a `null` entity
+ * Controls tab: on/off switches for the ventilation, light, entrance light and
+ * generator relays. `GET /api/controls` returns the live state; a `null` entity
  * means the relay bus was busy, so the first load renders it as off + muted
  * rather than as an error. Toggles flip optimistically and revert on any failed
  * POST.
  */
 
-type ControlKey = 'ventilation' | 'light' | 'generator';
+type ControlKey = 'ventilation' | 'light' | 'entrance_light' | 'generator';
 
 interface ControlView {
   value: boolean;
@@ -26,12 +26,14 @@ type ControlViews = Record<ControlKey, ControlView>;
 const INITIAL_VIEWS: ControlViews = {
   ventilation: { value: false, unknown: true },
   light: { value: false, unknown: true },
+  entrance_light: { value: false, unknown: true },
   generator: { value: false, unknown: true },
 };
 
 const ENTITIES: ReadonlyArray<{ key: ControlKey; label: string }> = [
   { key: 'ventilation', label: 'Ventilation' },
   { key: 'light', label: 'Light' },
+  { key: 'entrance_light', label: 'Entrance light' },
   { key: 'generator', label: 'Generator' },
 ];
 
@@ -50,6 +52,7 @@ export function ControlsPage() {
   const [pending, setPending] = useState<Record<ControlKey, boolean>>({
     ventilation: false,
     light: false,
+    entrance_light: false,
     generator: false,
   });
   const [actionError, setActionError] = useState<string | null>(null);
@@ -59,6 +62,7 @@ export function ControlsPage() {
     setViews((current) => ({
       ventilation: mergeEntity(current.ventilation, data.ventilation),
       light: mergeEntity(current.light, data.light),
+      entrance_light: mergeEntity(current.entrance_light, data.entrance_light),
       generator: mergeEntity(current.generator, data.generator),
     }));
   }, []);

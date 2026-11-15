@@ -24,6 +24,8 @@
 #include <sensor/anenji_mode_sensor.h>
 #include <relay/pcf8574.h>
 #include <light/relay_light.h>
+#include <binary_sensor/pcf8574.h>
+#include <enum/device_class.h>
 #include <health/device_health.h>
 #include <health/status_led.h>
 
@@ -89,9 +91,36 @@ PCF8574 inputExp(INPUT_IIC_ADDRESS);
 // I2C failure, so isEnabled() would falsely report both relays ON when absent.
 bool relayExpPresent = false;
 
+// Same convention for the input expander: a failed read returns 0 (which the
+// active-low driver would read as "active"), so the door sensor and wall switch
+// are only wired when the probe succeeded.
+bool inputExpPresent = false;
+
 EDCommon::Relay::PCF8574P ventilationRelay(&relayExp);
 EDCommon::Relay::PCF8574P lightRelay(&relayExp);
 EDCommon::Light::Relay light(&lightRelay);
+EDCommon::Relay::PCF8574P entranceLightRelay(&relayExp);
+EDCommon::Light::Relay entranceLight(&entranceLightRelay);
+
+// Door contact on DI1 (MQTT + HA binary_sensor).
+EDCommon::BinarySensor::PCF8574P doorSensor(
+    DOOR_SENSOR_INPUT_CHANNEL,
+    EDHA::deviceClassBinarySensorDoor,
+    DI_CONTACT_REVERSE,
+    &inputExp,
+    DOOR_SENSOR_DEBOUNCE_MS
+);
+
+// Latching wall switch on DI2, bound to the basement light through
+// Light::withWallSwitch. It is deliberately inited with no MQTT/discovery
+// options so it publishes nothing; the light's poll gate owns the sampling.
+EDCommon::BinarySensor::PCF8574P basementLightWallSwitch(
+    BASEMENT_SWITCH_INPUT_CHANNEL,
+    nullptr,
+    DI_CONTACT_REVERSE,
+    &inputExp,
+    BASEMENT_SWITCH_DEBOUNCE_MS
+);
 
 // Binary semaphore serializing Modbus bus access between the loop task and the
 // AsyncTCP/webserver task (extern-declared in src/web/handler.cpp as the RAII
@@ -99,9 +128,12 @@ EDCommon::Light::Relay light(&lightRelay);
 // any bus call; starts in the unlocked state.
 SemaphoreHandle_t modbusBus = nullptr;
 
-// Same pattern for the shared relay PCF8574 (its write() is a read-modify-write
-// of _dataOut and read() mutates _dataIn, so concurrent task access can corrupt
-// an I2C transaction). Extern-declared in src/web/handler.cpp as ControlGuard.
+// Same pattern for the two shared PCF8574 expanders on the I2C bus (write() is a
+// read-modify-write of _dataOut and read() mutates _dataIn, so concurrent task
+// access can corrupt an I2C transaction). Extern-declared in src/web/handler.cpp
+// as ControlGuard. Relay/light pumps are intentionally no longer gated on
+// mqtt.isConnected(): the library publish paths self-skip while offline and the
+// wall switch must work with the broker down.
 SemaphoreHandle_t controlBus = nullptr;
 
 Handler handler(&configMgr, &networkApi, &healthCheck, &modbus);
@@ -200,7 +232,8 @@ void setup()
     } else {
         LOGW("setup", "relay expander not found at 0x%02X", RELAY_IIC_ADDRESS);
     }
-    if (inputExp.begin()) {
+    inputExpPresent = inputExp.begin();
+    if (inputExpPresent) {
         LOGI("setup", "input expander found at 0x%02X", INPUT_IIC_ADDRESS);
     } else {
         LOGW("setup", "input expander not found at 0x%02X", INPUT_IIC_ADDRESS);
@@ -411,9 +444,9 @@ void setup()
     handler.setBms(Faraday::Bms::client());
 
     if (relayExpPresent) {
-        // The three relay/light inits touch the shared PCF8574 and must never be
-        // skipped: block (bounded in practice by the 200 ms handler guard) until
-        // the bus is free.
+        // The relay/light/wall-switch inits touch the shared PCF8574 and must
+        // never be skipped: block (bounded in practice by the 200 ms handler
+        // guard) until the bus is free.
         const bool controlBusLocked = controlBus != nullptr
             && xSemaphoreTake(controlBus, portMAX_DELAY) == pdTRUE;
 
@@ -430,12 +463,43 @@ void setup()
             LOGE("setup", "failed to init light relay");
         }
 
+        // Wall-switch binding sensor: interval 0 is REQUIRED because Light's
+        // withWallSwitch poll gate (below) owns the sampling cadence; a non-zero
+        // interval would let the base self-throttle and starve the binding.
+        // No options => it owns no topics and publishes nothing. With the input
+        // expander absent the reads stay at the stale-cold value, so the
+        // binding simply never sees an edge.
+        if (!basementLightWallSwitch.init(0, {})) {
+            LOGE("setup", "failed to init basement wall switch");
+        }
+
         // Must come after lightRelay.init(): light.init() re-reads the relay state.
+        // The latching wall switch is a Switch (follows every debounced change),
+        // not a Button; the first read only seeds, so no boot action happens and
+        // relays stay ALL OFF.
         if (!light.init({
                 EDCommon::Light::withMQTT(&mqtt, mqttPrefix, "faraday", "Light"),
                 EDCommon::Light::withDiscovery(&discoveryMgr, device),
+                EDCommon::Light::withWallSwitch(
+                    &basementLightWallSwitch,
+                    EDCommon::Light::WallSwitchType::Switch,
+                    BASEMENT_SWITCH_POLL_INTERVAL_MS
+                ),
             })) {
             LOGE("setup", "failed to init light");
+        }
+
+        // Same backing/facade split as the basement light; the backing relay owns
+        // no topics so only the light facade registers a HA entity.
+        if (!entranceLightRelay.init(ENTRANCE_LIGHT_RELAY_CHANNEL, {})) {
+            LOGE("setup", "failed to init entrance light relay");
+        }
+
+        if (!entranceLight.init({
+                EDCommon::Light::withMQTT(&mqtt, mqttPrefix, "faraday", "Entrance light"),
+                EDCommon::Light::withDiscovery(&discoveryMgr, device),
+            })) {
+            LOGE("setup", "failed to init entrance light");
         }
 
         Faraday::Automation::init(&mqtt, &discoveryMgr, device, mqttPrefix);
@@ -444,9 +508,24 @@ void setup()
             xSemaphoreGive(controlBus);
         }
 
-        handler.setControls(&ventilationRelay, &light, Faraday::Automation::changeover());
+        handler.setControls(&ventilationRelay, &light, &entranceLight, Faraday::Automation::changeover());
     } else {
         LOGW("setup", "relay expander absent - ventilation/light/generator disabled");
+    }
+
+    // BinarySensor::init() performs no I/O, so this needs no controlBus guard.
+    // With the expander absent no topics/entities are created (mirrors the
+    // relayExpPresent convention); the wall switch binding above stays wired to
+    // the stale input but never sees an edge.
+    if (inputExpPresent) {
+        if (!doorSensor.init(DOOR_SENSOR_POLL_INTERVAL_MS, {
+                EDCommon::BinarySensor::withMQTT(&mqtt, mqttPrefix, "faraday", "Door"),
+                EDCommon::BinarySensor::withDiscovery(&discoveryMgr, device),
+            })) {
+            LOGE("setup", "failed to init door sensor");
+        }
+    } else {
+        LOGW("setup", "input expander absent - door sensor and wall switch disabled");
     }
 
     inited = true;
@@ -471,6 +550,31 @@ void loop()
     ArduinoOTA.handle();
     healthCheck.loop();
     statusLed.update(mqtt.isConnected(), meterHealth, inverterHealth, bmsHealth);
+
+    // Inputs first: door state refresh. The wall switch is pumped inside
+    // light.update() below (its poll gate owns the sampling cadence). Both
+    // expanders share the I2C bus, so hold controlBus; on contention skip this
+    // cycle and retry next loop.
+    if (inputExpPresent && controlBus != nullptr && xSemaphoreTake(controlBus, pdMS_TO_TICKS(200)) == pdTRUE) {
+        doorSensor.update();
+        xSemaphoreGive(controlBus);
+    }
+
+    // I2C/MQTT work, not Modbus: drain the relay/light/generator command queues
+    // outside the bus guard. Light::Relay::update() also pumps the backing
+    // lightRelay, then light.update() pumps the wall-switch binding (30 ms gate)
+    // and drains its queue in the same call; the changeover facade pumps its two
+    // backing relays in the same pass. Runs regardless of mqtt.isConnected():
+    // the library publish paths self-skip while offline, and the physical wall
+    // switch must work with the broker down. On contention skip this cycle.
+    if (relayExpPresent && controlBus != nullptr && xSemaphoreTake(controlBus, pdMS_TO_TICKS(200)) == pdTRUE) {
+        ventilationRelay.update();
+        light.update();
+        entranceLight.update();
+        Faraday::Automation::update();
+        xSemaphoreGive(controlBus);
+    }
+
     // The bus is shared with the web handlers running in the AsyncTCP task:
     // hold the binary semaphore across modbus.loop() and the sensor polls. On
     // contention (take timeout) skip the whole bus-touching block this cycle:
@@ -508,22 +612,6 @@ void loop()
             if (anenji != nullptr) anenjiChargePrioritySensor.update();
         }
         xSemaphoreGive(modbusBus);
-    }
-
-    // I2C/MQTT work, not Modbus: drain the relay/light/generator command queues
-    // outside the bus guard. Light::Relay::update() also pumps the backing
-    // lightRelay; the changeover facade pumps its two backing relays in the same
-    // pass. The PCF8574 is shared with the web handlers, so hold controlBus
-    // across all updates; on contention skip the block this cycle (retry next).
-    // While the broker is down the command queues still fill from HTTP setState
-    // (queue-only, never blocks); pumping only retries doomed publishes and
-    // produced a per-loop LOGE storm (relay heartbeat) — on reconnect the
-    // queues drain and heartbeat resumes.
-    if (mqttUp && relayExpPresent && controlBus != nullptr && xSemaphoreTake(controlBus, pdMS_TO_TICKS(200)) == pdTRUE) {
-        ventilationRelay.update();
-        light.update();
-        Faraday::Automation::update();
-        xSemaphoreGive(controlBus);
     }
 
     // BLE/BMS work: no RS-485 or I2C access, so its own block outside both

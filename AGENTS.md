@@ -14,13 +14,20 @@ single-pixel status LED as a health indicator (green = ok, yellow = warning, red
 probes two PCF8574 expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, reads
 a JBD BMS over BLE, and emits one boot beep.
 
-Five domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
+Six domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
 voltage, current, active power, reactive power, frequency and a software-offset supplier
 energy counter, plus CT-ratio and supplier-sync settings; **relay control** — light and
-ventilation on the KC868-A8S relay bank through the PCF8574 output expander at `0x24`; a
+ventilation on the KC868-A8S relay bank through the PCF8574 output expander at `0x24`, plus a
+third **entrance light** on board relay K6 (channel 2, same backing/facade split,
+`faraday/<chip>/entrance_light/state|set`, one HA light entity "Entrance light"); a
 **manual mains/generator changeover switch** driving board relays K2+K5 through the same
 expander (one HA switch, `faraday/<chip>/generator/state|set`; ON = generator, both relays
-energized); and optional **Anenji 4200 hybrid inverter telemetry** over the same RS-485 bus
+energized); a **digital-inputs** domain on the PCF8574 input expander at `0x22` — a door
+contact on DI1 (one HA binary_sensor "Door", retained `faraday/<chip>/door/state` carrying
+`true`/`false`) and a latching basement wall switch on DI2 bound through ed-common
+`Light::withWallSwitch` to the basement light (no MQTT topics or HA entities at all,
+debounced, works with the broker down); optional **Anenji 4200 hybrid inverter telemetry**
+over the same RS-485 bus
 (12 numeric sensors + one battery-charging binary_sensor + four text-state mode/priority
 sensors — work mode, output mode, output priority, charge priority — read-only, no inverter
 control, Modbus slave address in config, disabled by default with `anenjiAddress = 0`); and
@@ -34,10 +41,10 @@ is hardware-verified on `SP22S003AP21S50A` (FW 7.6)); commands may require the J
 handshake, and there are no
 MOSFET/balancer writes. There is **no automatic** network↔generator switching yet — `src/automation/` is where that
 logic will go.
-There is still **no domain logic** for inputs (expander `0x22`), GSM, RF433, LED strips,
-analog inputs, RS-485 devices other than the WB-MAP12E and the Anenji 4200, or the buzzer
-beyond the boot beep. Those pins and objects are reserved for the next waves; do not describe
-them as working features. Target hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
+There is still **no domain logic** for GSM, RF433, LED strips, analog inputs, RS-485 devices
+other than the WB-MAP12E and the Anenji 4200, or the buzzer beyond the boot beep. Those pins
+and objects are reserved for the next waves; do not describe them as working features. Target
+hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
 `src/defines.h` declares model `ESP32-LAN8720`, with board revision **TBD**. PlatformIO board
 profile is `esp32dev`.
 
@@ -62,6 +69,11 @@ excluded (`AsyncTCP` is the ESP32 stack). Keep both entries when editing `lib_de
 `lib_deps` also includes `h2zero/NimBLE-Arduino@==1.4.3` for the BMS BLE domain and
 `adafruit/Adafruit NeoPixel@==1.12.3` for the single-pixel status LED (`STATUS_LED_PIN`
 GPIO12, GRBW type); the `lib_ignore` rule above is unchanged.
+
+`lib_deps` pins `ed-common` to tag `0.7.0` (`https://github.com/lan143/ed-common#0.7.0`),
+which adds `BinarySensor::PCF8574P` (debounced input-expander binary sensor), the
+`Light::withWallSwitch` binding and offline publish guards. Builds are reproducible from the
+repo alone again.
 
 OTA target and auth come from the **untracked** project-root `/.env` (copy `.env.example`):
 `FARADAY_OTA_IP` and `FARADAY_OTA_AUTH`. `scripts/ota_env.py` injects them into
@@ -155,9 +167,13 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   pointers + `Faraday::BatteryChargingState anenjiCharging` + four `Faraday::AnenjiModeSensor`
   objects (`anenjiWorkModeSensor`, `anenjiOutputModeSensor`, `anenjiOutputPrioritySensor`,
   `anenjiChargePrioritySensor`), two `PCF8574`
-  objects (`0x24` relay, `0x22` input), two `EDCommon::Relay::PCF8574P` objects
-  (`ventilationRelay`, `lightRelay`, both over `relayExp`),
-  `EDCommon::Light::Relay light` (wraps `lightRelay`), the `controlBus` semaphore,
+  objects (`0x24` relay, `0x22` input), three `EDCommon::Relay::PCF8574P` objects
+  (`ventilationRelay`, `lightRelay`, `entranceLightRelay`, all over `relayExp`),
+  `EDCommon::Light::Relay light` (wraps `lightRelay`, carries the wall-switch binding) and
+  `EDCommon::Light::Relay entranceLight` (wraps `entranceLightRelay`), two
+  `EDCommon::BinarySensor::PCF8574P` objects over `inputExp` (`doorSensor` on DI1 with the
+  door device class and 50 ms debounce, `basementLightWallSwitch` on DI2 with no device class
+  and no MQTT/discovery options), the `controlBus` semaphore,
   `Handler`, `Faraday::Health::StatusLed statusLed`, and the optional health adapters
   (`meterHealth`, `inverterHealth`, `bmsHealth`; see `src/health/`). The mains/generator changeover objects (two `EDCommon::Relay::PCF8574P` backing
   relays over `relayExp` and a `Relay`-derived `GeneratorChangeover` facade) live at file
@@ -172,7 +188,7 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   (early return on failure) → config defaults → `configMgr.load()` → network logger init →
   `Serial2.begin(config->modbusSpeed, …)` (RS-485) + `modbus.init(15)` → `Serial1` (GSM
   placeholder) → `Wire` at 100 kHz → PCF8574 probes (relay probe result stored in the
-  `relayExpPresent` flag) → `networkMgr.init(..., hasEth=true, ...)`
+  `relayExpPresent` flag, input probe in `inputExpPresent`) → `networkMgr.init(..., hasEth=true, ...)`
   → ArduinoOTA password/begin → MQTT init → network connect callback (logger + MQTT
   connect/disconnect) → healthcheck registers `mqtt`, `MeterHealth`, optional `InverterHealth`
   and `BmsHealth` (in that order, all before `handler.init()` starts the web server because
@@ -205,31 +221,47 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   skipping it would leave ventilation/light/generator on uninitialized channels while the API is
   still wired to them) initializing
   `ventilationRelay` (MQTT + discovery) → `lightRelay` (channel only, no options) →
-  `light` (MQTT + discovery) → `Faraday::Automation::init(&mqtt, &discoveryMgr, device,
+  `basementLightWallSwitch.init(0, {})` (interval 0 is REQUIRED — the light's wall-switch poll
+  gate owns the sampling cadence; no options ⇒ it owns no topics and publishes nothing) →
+  `light` (MQTT + discovery + `withWallSwitch(&basementLightWallSwitch, Switch, 30 ms)`; the
+  binding seeds on its first read without acting, so the boot default stays ALL OFF) →
+  `entranceLightRelay` (channel only) → `entranceLight` (MQTT `"Entrance light"` +
+  discovery) → `Faraday::Automation::init(&mqtt, &discoveryMgr, device,
   mqttPrefix)` (the two backing changeover relays first with empty options, then the facade
   with `withMQTT(..., "Generator")` + `withDiscovery`, which auto-subscribes
   `faraday/<chip>/generator/set` and registers one HA switch on the same device), then
-  `handler.setControls(&ventilationRelay, &light, Faraday::Automation::changeover())` →
+  `handler.setControls(&ventilationRelay, &light, &entranceLight, Faraday::Automation::changeover())`.
+  After that block, a standalone `inputExpPresent`-gated (no I2C access, no `controlBus` guard,
+  because `BinarySensor::init()` does no I/O) `doorSensor.init(DOOR_SENSOR_POLL_INTERVAL_MS,
+  {withMQTT(..., "Door"), withDiscovery(...)})`; with the input expander absent no door
+  entity/topic is created (mirrors `relayExpPresent`). Then
   `inited = true` → `statusLed.begin()` → one 2700 Hz / 150 ms boot beep.
 - `loop()` order: `RebootAfterResponse::update()` first, then `networkMgr.loop()`,
   `discoveryMgr.loop()`, `ArduinoOTA.handle()`, `healthCheck.loop()`,
   `statusLed.update(mqtt.isConnected(), meterHealth, inverterHealth, bmsHealth)` (reads the
-  adapters' cached `level()` getters only and paints only on change/first), `modbus.loop()`,
+  adapters' cached `level()` getters only and paints only on change/first), then a
+  `controlBus`-guarded **input block** run only when `inputExpPresent` (200 ms take, skipped
+  on contention and retried next iteration) that calls `doorSensor.update()` — placed before
+  the Modbus block so door sampling is not delayed by a possible ~135 ms meter stall; the
+  basement wall switch is NOT pumped here (its poll gate is inside `light.update()` below,
+  which owns the sampling cadence), then a `controlBus`-guarded **relay pump block** run only
+  when `relayExpPresent` (same 200 ms take) that calls `ventilationRelay.update()` +
+  `light.update()` + `entranceLight.update()` + `Faraday::Automation::update()`. The pump is
+  **no longer gated on `mqtt.isConnected()`**: the library publish paths self-skip while
+  offline (relay heartbeat and `BinarySensor::publishState` guard on `isConnected()`, the
+  relay/light state producers fail fast), so an offline broker produces no log storm, and the
+  physical wall switch must work with the broker down. Commands queue from HTTP/HA
+  `setState` and now apply on the next pump instead of waiting for a reconnect;
+  `Light::Relay::update()` pumps the backing relay and then `Light::update()` — never call
+  `lightRelay.update()` directly — and `Light::update()` polls the wall-switch binding first
+  and drains its command queue in the same call; `Automation::update()` pumps the changeover
+  facade and then both backing relays in the same pass. Then `modbus.loop()`,
   the six null-guarded supplier `update()` calls plus the twelve null-guarded Anenji float
   sensor updates, `anenjiCharging.update()` and the four `anenji != nullptr`-guarded
   `AnenjiModeSensor::update()` calls (all 23 inside the `modbusBus` block; each object gates
   its own Modbus read internally — floats staggered 10 000–18 800 ms, charging 10 s, work
-  mode 10 s, the three setting modes 30 s, mode first reads staggered `800 * index` ms), a
-  `controlBus`-guarded `ventilationRelay.update()` + `light.update()` +
-  `Faraday::Automation::update()` block **outside**
-  the `modbusBus` block, run only when `mqtt.isConnected()` and `relayExpPresent` (the probe
-  result stored in a flag — the relay/light/generator objects stay uninitialized when the
-  expander is absent, so the block is skipped entirely; otherwise 200 ms take, skipped on
-  contention and retried next iteration; commands queue from HTTP `setState` while the broker
-  is down and drain on reconnect;
-  `Light::Relay::update()` also pumps the backing relay — never call `lightRelay.update()`
-  directly; `Automation::update()` pumps the changeover facade and then both backing relays
-  in the same pass), `Faraday::Bms::update(mqttUp)` (copies the mutex-guarded BLE snapshot
+  mode 10 s, the three setting modes 30 s, mode first reads staggered `800 * index` ms),
+  `Faraday::Bms::update(mqttUp)` (copies the mutex-guarded BLE snapshot
   into a loop-task cache and pumps the BMS sensor objects only when the BLE link is
   connected and MQTT is ready; no RS-485 or I2C access), then the
   electricity-status evaluation/publish
@@ -292,8 +324,8 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
     class/state class), the four Anenji mode sensors and three BMS text sensors as plain
     text-state `sensor`s (state topic + `{{ value }}` value template — no unit/device
     class/state class, `EDHA::Sensor` emits those only when set), the ventilation and
-    generator **switches**, the light **light**, and the battery-charging/BMS
-    **binary_sensors**.
+    generator **switches**, the light **lights** (basement `light` + `"Entrance light"`), and
+    the battery-charging/BMS/**Door** **binary_sensors**.
   - `ed-healthcheck` — `Ready` interface + `HealthCheck`. Registered services, in order:
     `mqtt` always, then `MeterHealth`, `InverterHealth` (only when `anenji != nullptr` at
     boot) and `BmsHealth` (only when a BMS MAC is configured at boot). The device adapters
@@ -313,7 +345,13 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
     Also `EDCommon::Relay::PCF8574P` (channel + shared PCF8574 driver; active-low ON = `LOW`
     is hardcoded in it) and `EDCommon::Light::Relay` (light facade over a backing relay):
     their `init()` auto-subscribes the MQTT command topic and registers the HA switch/light
-    entity when given MQTT/discovery options.
+    entity when given MQTT/discovery options. `EDCommon::BinarySensor::PCF8574P` is the input
+    backend (channel, device class, reverse applied by the base, `debounceMs` stable-for-T
+    filter) and the `Light::withWallSwitch(sensor, WallSwitchType, pollMs)` option binds a
+    sensor to a light: `Button` toggles on a debounced rising edge, `Switch` follows debounced
+    changes, the binding is polled at the top of `Light::update()` and drained in the same
+    call, and the first valid read only seeds (no boot action). Relay/light/binary-sensor
+    publishes self-skip while MQTT is disconnected.
   - `NimBLE-Arduino` — BLE stack used only by `src/bms/` (JBD client, characteristic
     notifications, scan); no BLE calls run outside the `"bms"` task.
   - `ESPAsyncWebServer` — port 80, no authentication.
@@ -359,8 +397,17 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   `faraday/<chip>/ventilation/state|set` and `faraday/<chip>/light/state|set`: commands are
   plain `on`/`off` (non-retained, auto-subscribed inside `init()`), state is published as
   non-retained JSON `{"enabled":"on"}` with a 60 s heartbeat, and each registers an entity on
-  the same device — an HA **switch** for ventilation, an HA **light** for light. The backing
-  `lightRelay` is initialized with no options, so it owns no topics and registers nothing.
+  the same device — an HA **switch** for ventilation, an HA **light** for light. The entrance
+  light behaves identically on `faraday/<chip>/entrance_light/state|set` and registers one
+  more HA **light** ("Entrance light") on the same device. The backing `lightRelay` and
+  `entranceLightRelay` are initialized with no options, so they own no topics and register
+  nothing. The door contact publishes retained `true`/`false` on
+  `faraday/<chip>/door/state` and registers one HA **binary_sensor** ("Door",
+  `device_class door`) on the same device; it publishes on change with a 60 s heartbeat,
+  nothing before the first valid read, and while MQTT is offline the publish is skipped
+  silently and the true state republishes on the first update after reconnect. The DI2
+  basement wall switch owns **no MQTT topics and no HA entities**: it only drives the light
+  through `Light::withWallSwitch` (the sensor is inited with no options).
   The generator changeover uses `faraday/<chip>/generator/state|set`: commands are plain
   `on`/`off` (non-retained; `on` = generator mode with both changeover relays energized,
   `off` = mains with both de-energized), state is published as non-retained JSON
@@ -458,8 +505,8 @@ the config/backup routes take raw bodies.
 | `/api/bms/scan/start` | POST | Starts the ~10 s BLE scan; 200 `{}`, 422 `{"message":"scan already running"}`, 500 `{"message":"bms not initialized"}`; disconnects the BMS while scanning |
 | `/api/bms/scan/status` | GET | 200 `{running, generation, devices:[{mac,name,rssi}]}`; results persist after the scan ends (RAM-only, max 20); 500 `{"message":"bms not initialized"}` |
 | `/api/bms/clear_errors` | POST | Runs the one-shot factory/EEPROM-mode counter clear (hardware-verified on `SP22S003AP21S50A`, FW 7.6): enter `DD 5A 00 02 56 78 FF 30 77`, wait ~200 ms, exit-with-clear `DD 5A 01 02 28 28 FF AD 77`; no telemetry reads interleave, non-zero statuses (e.g. `0x80`) are logged, optimistic counters zero until the next 0xAA read; 200 `{}`, 422 `{"message":"scan is running"\|"bms is not connected"\|"clear already running"}`, 500 `{"message":"bms not initialized"}`; no config store, no reboot |
-| `/api/controls` | GET | JSON `{"ventilation":{"enabled":bool\|null},"light":{"enabled":bool\|null},"generator":{"enabled":bool\|null}}`; a field is `null` when the live readback is unavailable because the 200 ms `controlBus` guard timed out (meter-null convention, still 200); 500 `{"message":"controls not initialized"}` before `handler.setControls()` wiring |
-| `/api/controls` | POST | JSON (max 1024 B), at least one of `ventilation`/`light`/`generator` (booleans): none → 422 `{"message":"ventilation or light or generator: required"}`, non-bool → 422 `{"message":"<field>: invalid value"}`; `setState()` only enqueues (never needs the bus), 200 echoes the requested values for touched fields while untouched fields are a readback or `null` on guard timeout; `500 {"message":"controls busy"}` if a command enqueue fails (full internal queue — rare); no config store, no reboot |
+| `/api/controls` | GET | JSON `{"ventilation":{"enabled":bool\|null},"light":{"enabled":bool\|null},"entrance_light":{"enabled":bool\|null},"generator":{"enabled":bool\|null}}`; a field is `null` when the live readback is unavailable because the 200 ms `controlBus` guard timed out (meter-null convention, still 200); 500 `{"message":"controls not initialized"}` before `handler.setControls()` wiring |
+| `/api/controls` | POST | JSON (max 1024 B), at least one of `ventilation`/`light`/`entrance_light`/`generator` (booleans): none → 422 `{"message":"ventilation or light or entrance_light or generator: required"}`, non-bool → 422 `{"message":"<field>: invalid value"}`; `setState()` only enqueues (never needs the bus), 200 echoes the requested values for touched fields while untouched fields are a readback or `null` on guard timeout; `500 {"message":"controls busy"}` if a command enqueue fails (full internal queue — rare); no config store, no reboot |
 | `/healthcheck/healty` | GET | Always 200 `{"healty":true}` (the typo is the ed-healthcheck API) |
 | `/healthcheck/ready` | GET | 200 `{"ready":true,"message":…,"warning":…,"warningMessage":…}` or 500 `ready:false`. Services in order: `mqtt`, then meter, inverter (only when enabled at boot) and BMS (only when a MAC is configured at boot). MQTT not connected, meter/inverter unreachable (`wb-map12e is not responding` / `anenji is not responding`) or a device fault (Anenji fault code / work mode Fault, BMS live protection bitmask) => `ready:false`/500 (generic `service success count less min sucess count` until the 4th consecutive failing check). BMS BLE unavailable/disconnected/stale, BMS latched error counters (`bms error counters (latched): …`) and an active Anenji warning (`anenji warning code 0x...`, register 104) => `warning:true` with `warningMessage` (`bms: BLE stack unavailable`, `bms is not connected`, `bms data is stale`, `bms error counters (latched): …`, `anenji warning code 0x00000010`; `bms is not available` is the defensive null-client case) but still 200. `warningMessage` shows the LAST warning service in registration order (BMS comes after inverter), so a concurrent BMS warning hides the Anenji warning text |
 
@@ -584,7 +631,7 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 - After a config reset the Modbus defaults are already usable (meter address 1, inverter
   disabled at 0), so no address edit is required for the meter — but a previously enabled
   inverter must be re-enabled (`anenjiAddress` set + reboot) after a `/config.bin` wipe.
-- `ed-wb` and `ed-common` are git-pinned (`ed-wb#dfa808b1…`, `ed-common#0.6.0`); the WB-MAP12E
+- `ed-wb` and `ed-common` are git-pinned (`ed-wb#dfa808b1…`, `ed-common#0.7.0`); the WB-MAP12E
   support and the sensor family ship in those releases; `lib_ignore = ESPAsyncTCP, RPAsyncTCP`
   must stay or a clean resolve pulls the wrong TCP stacks.
 - `cd frontend && npm run build` uses Vite `emptyOutDir: true` and **rewrites `data/`**,
@@ -650,11 +697,14 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   `show()` costs tens of µs and only runs on level change; RMT + BLE (NimBLE) coexistence and
   the RGBW byte order (`NEO_GRBW`) are hardware-unverified.
 - PCF8574 probe failures at `0x24`/`0x22` are logged as warnings by design when no expanders
-  are attached; with `0x24` missing the relay domain is disabled at boot — ventilation/light
-  and generator init and handler wiring are skipped, no MQTT subscriptions or HA entities are
-  registered, and `/api/controls` replies 500 `{"message":"controls not initialized"}` (because
-  a failed PCF8574 read returns 0, which the active-low driver would report as ON), while the
-  input expander `0x22` still has no domain logic attached.
+  are attached; with `0x24` missing the relay domain is disabled at boot — ventilation/light,
+  the entrance light and generator init and handler wiring are skipped, no MQTT subscriptions
+  or HA entities are registered, and `/api/controls` replies 500
+  `{"message":"controls not initialized"}` (because a failed PCF8574 read returns 0, which the
+  active-low driver would report as ON). With `0x22` missing the digital-inputs domain is
+  degraded rather than fatal: the door sensor is not inited (no `"Door"` entity/topic) and the
+  DI2 wall-switch binding stays wired to the stale input, so it never sees an edge and the
+  basement light is HA/panel-only. Both probes still log a warning.
 - Relays are **ALL OFF after every boot/reboot**: `relayExp.begin()` writes `0xFF` to the
   bank before any other write, and relay state is intentionally not persisted (no relay
   `Config` fields — `CURRENT_VERSION` is 5 because of the BMS fields, and 4 was only because
@@ -662,12 +712,14 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 - The reverse-order mapping K3 → channel 5 (ventilation) / K4 → channel 4 (light) is
   **hardware-verified** (forward mapping 2/3 was observed firing relays K6/K5; the PCF8574
   drives the bank reversed: board relay K_n = channel 8−n, remaining channels inferred from
-  that formula, not individually verified); K2 → channel 6 and K5 → channel 3 (generator
-  changeover) follow the same formula but are **not yet individually hardware-verified**. The
+  that formula, not individually verified); K6 → channel 2 (entrance light) and K2 → channel 6
+  and K5 → channel 3 (generator changeover) follow the same formula but are **not yet
+  individually hardware-verified**. The
   active-low ON = `LOW` polarity is confirmed working (relay fires) and stays hardcoded in
   `EDCommon::Relay::PCF8574P`; the channel
   numbers live only in `src/defines.h` (`VENTILATION_RELAY_CHANNEL`, `LIGHT_RELAY_CHANNEL`,
-  `CHANGEOVER_RELAY_K2_CHANNEL`, `CHANGEOVER_RELAY_K5_CHANNEL`) — change them there only.
+  `ENTRANCE_LIGHT_RELAY_CHANNEL`, `CHANGEOVER_RELAY_K2_CHANNEL`,
+  `CHANGEOVER_RELAY_K5_CHANNEL`) — change them there only.
 - Generator mode is a **manual** switch only: it is not reflected in `ElectricityStatus`
   (`ON_GENERATOR` stays reserved) and no automatic network↔generator switching exists yet;
   that logic belongs in `src/automation/`.
@@ -676,7 +728,25 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   an error (the `POST` command itself still applies — `setState()` only enqueues).
 - `lightRelay` is initialized deliberately with **no MQTT/discovery options** so it does not
   register a duplicate HA switch next to the light entity; only the `light` facade owns the
-  topics.
+  topics. `entranceLightRelay` follows the same backing/facade split (no options; the
+  `entranceLight` facade owns `faraday/<chip>/entrance_light/state|set` and the HA entity).
+- The DI_n → PCF8574 channel mapping is **assumed forward** (`DI1` → channel 0, `DI2` →
+  channel 1) and the contact polarity is **assumed active-low** (`DI_CONTACT_REVERSE = true`) —
+  both are **hardware-unverified**. The output bank was measured reversed, so if DI1/DI2 do not
+  react to the contacts try `7`/`6` (reverse order) in `src/defines.h`; if the reported door
+  state reads inverted, flip `DI_CONTACT_REVERSE` instead. The channel/polarity constants are
+  `DOOR_SENSOR_INPUT_CHANNEL`, `BASEMENT_SWITCH_INPUT_CHANNEL`, `DI_CONTACT_REVERSE`.
+- The latching basement wall switch drives the light only: its debounce is 50 ms and the
+  `Light::withWallSwitch` poll gate runs every 30 ms, so a press reacts in ≈ debounce 50 ms +
+  ≤30 ms poll + one loop iteration. It publishes nothing and never depends on MQTT, so the
+  physical switch works with the broker down; the light's wall-switch binding seeds on the
+  first valid read without acting, so a boot always starts ALL OFF.
+- The relay/light/generator pump **runs without MQTT** (it is no longer gated on
+  `mqtt.isConnected()`), because the library publish paths self-skip offline (relay heartbeat
+  guards on `isConnected()`, `BinarySensor::publishState` returns early, the relay/light state
+  producers fail fast without logging). This replaces the old "queue commands while offline and
+  drain on reconnect" behavior: an HTTP/HA command now applies on the next pump, and the true
+  state republishes on the first heartbeat after reconnect.
 - `env:faraday_ota` without a command-line target may build with the dev fallback OTA
   password and falls back to `esptool`; any actual upload target requires `.env` and fails
   early if either key is missing. Never put real credentials in the repo.
@@ -710,8 +780,9 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   ed-utils `LOGD`/`LOGV` bypass the compile-time gate via `esp_log_write` — a boot abort was
   reproduced at ~24 s uptime when a full MQTT publish-payload dump (ed-mqtt `mqtt.cpp:108`)
   appended past the 16 KiB reserved capacity and the ~32 KiB realloc threw `bad_alloc`;
-  relay/light/generator pumps likewise; the proper fix belongs upstream in ed-utils (bound
-  append by remaining capacity).
+  the relay/light/generator pump no longer needs an `mqtt.isConnected()` gate because its
+  library publish paths self-skip offline without logging; the proper fix belongs upstream in
+  ed-utils (bound append by remaining capacity).
 - A BLE scan **disconnects the BMS** while it runs (~10 s). Scan results are RAM-only, keep up
   to 20 devices, and persist after the scan finishes; a new scan replaces them.
 - The BMS is **read-only except the operator-triggered factory-mode counter clear**: Faraday

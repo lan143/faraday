@@ -10,12 +10,13 @@
 #define ANALOG_A3 34
 #define ANALOG_A4 35
 
-// I2C bus (PCF8574 expanders). The relay bank now has domain logic; the input
-// expander still has none.
+// I2C bus (PCF8574 expanders). The output expander drives the relay bank
+// (ventilation/light/entrance light/generator); the input expander carries the
+// door contact and the basement wall switch.
 #define IIC_SDA 4
 #define IIC_SCL 5
 #define RELAY_IIC_ADDRESS 0x24   // PCF8574 output expander (relays)
-#define INPUT_IIC_ADDRESS 0x22   // PCF8574 input expander (no domain logic attached yet)
+#define INPUT_IIC_ADDRESS 0x22   // PCF8574 input expander (door contact, wall switch)
 
 // The PCF8574 @ RELAY_IIC_ADDRESS drives the KC868-A8S relay bank in REVERSE
 // board order — board relay K_n = channel (8 - n); formula verified on hardware
@@ -23,8 +24,26 @@
 // (2/3) was observed firing K6/K5; change channel numbers here only.
 #define VENTILATION_RELAY_CHANNEL 5 // board relay K3
 #define LIGHT_RELAY_CHANNEL 4       // board relay K4
+#define ENTRANCE_LIGHT_RELAY_CHANNEL 2 // board relay K6 — reverse formula 8-6 (formula hardware-verified for K3/K4 only; K6 not individually verified)
 #define CHANGEOVER_RELAY_K2_CHANNEL 6 // board relay K2 (mains/generator changeover, shared with K5)
 #define CHANGEOVER_RELAY_K5_CHANNEL 3 // board relay K5 (mains/generator changeover, shared with K2)
+
+// Digital inputs sit on the PCF8574 @ INPUT_IIC_ADDRESS. The DI_n -> channel
+// mapping below is ASSUMED FORWARD (DI1 -> 0) and NOT hardware-verified — the
+// output bank was measured to be reversed, so if DI1/DI2 do not react to the
+// contacts try 7/6 instead (reverse order). Contact polarity is assumed
+// active-low (DI_CONTACT_REVERSE) — set it to false if the reported state reads
+// inverted.
+#define DOOR_SENSOR_INPUT_CHANNEL 0      // DI1
+#define BASEMENT_SWITCH_INPUT_CHANNEL 1  // DI2
+#define DI_CONTACT_REVERSE true
+#define DOOR_SENSOR_POLL_INTERVAL_MS 200
+#define DOOR_SENSOR_DEBOUNCE_MS 50
+// Sampling cadence of the latching basement wall switch. Must match the
+// Light::withWallSwitch poll interval: the light's poll gate owns the sensor
+// sampling (the sensor is inited with update interval 0).
+#define BASEMENT_SWITCH_POLL_INTERVAL_MS 30
+#define BASEMENT_SWITCH_DEBOUNCE_MS 50
 
 // Shared sensor/LED connector (one device at a time: DS18B20 / DHT11 / DHT21 / LED strip #2)
 #define SENSOR_BUS_PIN 14

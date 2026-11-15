@@ -54,9 +54,10 @@ namespace
         bool locked;
     };
 
-    // RAII accessor for the shared relay PCF8574. Same bounded take/release
-    // semantics as ModbusGuard; !locked means the readback is unavailable and
-    // callers report null instead of a possibly torn value.
+    // RAII accessor for the shared PCF8574 expanders (relay output and inputs).
+    // Same bounded take/release semantics as ModbusGuard; !locked means the
+    // readback is unavailable and callers report null instead of a possibly torn
+    // value.
     struct ControlGuard
     {
         ControlGuard()
@@ -409,10 +410,11 @@ void Handler::setAnenji(EDWB::ANENJI4200* anenji)
     _anenji = anenji;
 }
 
-void Handler::setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light, EDCommon::Relay::Relay* generator)
+void Handler::setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light, EDCommon::Light::Light* entranceLight, EDCommon::Relay::Relay* generator)
 {
     _ventilationRelay = ventilation;
     _light = light;
+    _entranceLight = entranceLight;
     _generatorSwitch = generator;
 }
 
@@ -897,13 +899,14 @@ void Handler::sendControlsState(
     int status,
     std::pair<bool, bool> ventilation,
     std::pair<bool, bool> light,
+    std::pair<bool, bool> entranceLight,
     std::pair<bool, bool> generator
 )
 {
     AsyncResponseStream* response = request->beginResponseStream("application/json");
     response->setCode(status);
 
-    std::string payload = EDUtils::buildJson([ventilation, light, generator](JsonObject entity) {
+    std::string payload = EDUtils::buildJson([ventilation, light, entranceLight, generator](JsonObject entity) {
         if (ventilation.first) {
             entity["ventilation"]["enabled"] = ventilation.second;
         } else {
@@ -914,6 +917,12 @@ void Handler::sendControlsState(
             entity["light"]["enabled"] = light.second;
         } else {
             entity["light"]["enabled"] = nullptr;
+        }
+
+        if (entranceLight.first) {
+            entity["entrance_light"]["enabled"] = entranceLight.second;
+        } else {
+            entity["entrance_light"]["enabled"] = nullptr;
         }
 
         if (generator.first) {
@@ -930,7 +939,7 @@ void Handler::sendControlsState(
 void Handler::registerControlHandlers()
 {
     _server->on("/api/controls", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        if (_ventilationRelay == nullptr || _light == nullptr || _generatorSwitch == nullptr) {
+        if (_ventilationRelay == nullptr || _light == nullptr || _entranceLight == nullptr || _generatorSwitch == nullptr) {
             request->send(500, "application/json", "{\"message\": \"controls not initialized\"}");
             return;
         }
@@ -940,6 +949,7 @@ void Handler::registerControlHandlers()
         // The guard is scoped to the reads only, not the JSON serialization.
         std::pair<bool, bool> ventilationState = {false, false};
         std::pair<bool, bool> lightState = {false, false};
+        std::pair<bool, bool> entranceLightState = {false, false};
         std::pair<bool, bool> generatorState = {false, false};
 
         {
@@ -949,15 +959,17 @@ void Handler::registerControlHandlers()
                 // read is reported as disabled rather than failing the request.
                 const auto ventilation = _ventilationRelay->isEnabled();
                 const auto light = _light->isEnabled();
+                const auto entranceLight = _entranceLight->isEnabled();
                 const auto generator = _generatorSwitch->isEnabled();
 
                 ventilationState = {true, ventilation.second && ventilation.first};
                 lightState = {true, light.second && light.first};
+                entranceLightState = {true, entranceLight.second && entranceLight.first};
                 generatorState = {true, generator.second && generator.first};
             }
         }
 
-        sendControlsState(request, 200, ventilationState, lightState, generatorState);
+        sendControlsState(request, 200, ventilationState, lightState, entranceLightState, generatorState);
     });
 
     auto* postHandler = new AsyncCallbackJsonWebHandler(
@@ -968,21 +980,23 @@ void Handler::registerControlHandlers()
                 return;
             }
 
-            if (_ventilationRelay == nullptr || _light == nullptr || _generatorSwitch == nullptr) {
+            if (_ventilationRelay == nullptr || _light == nullptr || _entranceLight == nullptr || _generatorSwitch == nullptr) {
                 request->send(500, "application/json", "{\"message\": \"controls not initialized\"}");
                 return;
             }
 
             const JsonVariant ventilationValue = json["ventilation"];
             const JsonVariant lightValue = json["light"];
+            const JsonVariant entranceLightValue = json["entrance_light"];
             const JsonVariant generatorValue = json["generator"];
 
             const bool hasVentilation = !ventilationValue.isNull();
             const bool hasLight = !lightValue.isNull();
+            const bool hasEntranceLight = !entranceLightValue.isNull();
             const bool hasGenerator = !generatorValue.isNull();
 
-            if (!hasVentilation && !hasLight && !hasGenerator) {
-                sendFieldError(request, "ventilation or light or generator", "required");
+            if (!hasVentilation && !hasLight && !hasEntranceLight && !hasGenerator) {
+                sendFieldError(request, "ventilation or light or entrance_light or generator", "required");
                 return;
             }
 
@@ -993,6 +1007,11 @@ void Handler::registerControlHandlers()
 
             if (hasLight && !lightValue.is<bool>()) {
                 sendFieldError(request, "light", "invalid value");
+                return;
+            }
+
+            if (hasEntranceLight && !entranceLightValue.is<bool>()) {
+                sendFieldError(request, "entrance_light", "invalid value");
                 return;
             }
 
@@ -1017,6 +1036,13 @@ void Handler::registerControlHandlers()
                 lightEnqueued = _light->setState(lightEnabled);
             }
 
+            bool entranceLightEnabled = false;
+            bool entranceLightEnqueued = true;
+            if (hasEntranceLight) {
+                entranceLightEnabled = entranceLightValue.as<bool>();
+                entranceLightEnqueued = _entranceLight->setState(entranceLightEnabled);
+            }
+
             bool generatorEnabled = false;
             bool generatorEnqueued = true;
             if (hasGenerator) {
@@ -1026,16 +1052,17 @@ void Handler::registerControlHandlers()
 
             // A full internal queue drops the command silently: report busy
             // instead of echoing a 200 for a command that never landed.
-            if (!ventilationEnqueued || !lightEnqueued || !generatorEnqueued) {
+            if (!ventilationEnqueued || !lightEnqueued || !entranceLightEnqueued || !generatorEnqueued) {
                 request->send(500, "application/json", "{\"message\": \"controls busy\"}");
                 return;
             }
 
             std::pair<bool, bool> ventilationState = {true, ventilationEnabled};
             std::pair<bool, bool> lightState = {true, lightEnabled};
+            std::pair<bool, bool> entranceLightState = {true, entranceLightEnabled};
             std::pair<bool, bool> generatorState = {true, generatorEnabled};
 
-            if (!hasVentilation || !hasLight || !hasGenerator) {
+            if (!hasVentilation || !hasLight || !hasEntranceLight || !hasGenerator) {
                 // One guard instance shared by all readbacks; only acquired
                 // when an untouched field actually needs one.
                 ControlGuard bus;
@@ -1052,6 +1079,12 @@ void Handler::registerControlHandlers()
                         : std::make_pair(false, false);
                 }
 
+                if (!hasEntranceLight) {
+                    entranceLightState = bus.locked
+                        ? std::make_pair(true, _entranceLight->isEnabled().first)
+                        : std::make_pair(false, false);
+                }
+
                 if (!hasGenerator) {
                     generatorState = bus.locked
                         ? std::make_pair(true, _generatorSwitch->isEnabled().first)
@@ -1059,7 +1092,7 @@ void Handler::registerControlHandlers()
                 }
             }
 
-            sendControlsState(request, 200, ventilationState, lightState, generatorState);
+            sendControlsState(request, 200, ventilationState, lightState, entranceLightState, generatorState);
         }
     );
     postHandler->setMethod(HTTP_POST);

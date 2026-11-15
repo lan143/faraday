@@ -424,7 +424,7 @@ export function saveMeterSettings(
   );
 }
 
-/** GET /api/controls — ventilation and light relay state. */
+/** GET /api/controls — ventilation, light, entrance light and generator relay state. */
 export function getControls(): Promise<ApiResult<ControlsState>> {
   return getJson<ControlsState>('/api/controls', EMPTY_BODY_MESSAGE);
 }
@@ -438,9 +438,15 @@ export function getControls(): Promise<ApiResult<ControlsState>> {
 export function saveControls(payload: {
   ventilation?: boolean;
   light?: boolean;
+  entrance_light?: boolean;
   generator?: boolean;
 }): Promise<ApiResult<ControlsState>> {
-  const body: { ventilation?: boolean; light?: boolean; generator?: boolean } = {};
+  const body: {
+    ventilation?: boolean;
+    light?: boolean;
+    entrance_light?: boolean;
+    generator?: boolean;
+  } = {};
 
   if (payload.ventilation !== undefined) {
     if (typeof payload.ventilation !== 'boolean') {
@@ -456,6 +462,13 @@ export function saveControls(payload: {
     body.light = payload.light;
   }
 
+  if (payload.entrance_light !== undefined) {
+    if (typeof payload.entrance_light !== 'boolean') {
+      throw new Error('Entrance light must be true or false.');
+    }
+    body.entrance_light = payload.entrance_light;
+  }
+
   if (payload.generator !== undefined) {
     if (typeof payload.generator !== 'boolean') {
       throw new Error('Generator must be true or false.');
@@ -466,9 +479,10 @@ export function saveControls(payload: {
   if (
     body.ventilation === undefined &&
     body.light === undefined &&
+    body.entrance_light === undefined &&
     body.generator === undefined
   ) {
-    throw new Error('ventilation or light or generator required.');
+    throw new Error('ventilation or light or entrance light or generator required.');
   }
 
   return postJson<ControlsState>('/api/controls', body, EMPTY_BODY_MESSAGE);

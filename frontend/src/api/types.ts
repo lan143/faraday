@@ -125,6 +125,7 @@ export interface ControlsEntity {
 export interface ControlsState {
   ventilation: ControlsEntity;
   light: ControlsEntity;
+  entrance_light: ControlsEntity;
   generator: ControlsEntity;
 }
 

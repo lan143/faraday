@@ -63,7 +63,7 @@ public:
     void init();
     void setMap12E(EDWB::MAP12E* map12e);
     void setAnenji(EDWB::ANENJI4200* anenji);
-    void setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light, EDCommon::Relay::Relay* generator);
+    void setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light, EDCommon::Light::Light* entranceLight, EDCommon::Relay::Relay* generator);
     void setBms(Faraday::Bms::Client* client);
 
 private:
@@ -84,6 +84,7 @@ private:
         int status,
         std::pair<bool, bool> ventilation,
         std::pair<bool, bool> light,
+        std::pair<bool, bool> entranceLight,
         std::pair<bool, bool> generator
     );
 
@@ -97,6 +98,7 @@ private:
     Faraday::Bms::Client* _bms = nullptr;
     EDCommon::Relay::Relay* _ventilationRelay = nullptr;
     EDCommon::Light::Light* _light = nullptr;
+    EDCommon::Light::Light* _entranceLight = nullptr;
     EDCommon::Relay::Relay* _generatorSwitch = nullptr;
     EDConfig::ConfigFileHandler _configFileHandler;
     EDConfig::ConfigBackupHandler _configBackupHandler;
