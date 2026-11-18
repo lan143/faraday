@@ -13,6 +13,7 @@
 #include <log/log.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <strings.h>
@@ -112,8 +113,16 @@ struct Faraday::Bms::Client::Impl
     // callback can wake the owning task. Only one scan can be active.
     static Impl* scanOwner;
 
+    // Latest loop-task network verdict. Cross-task single-writer (loop task) /
+    // single-reader (bms task) plain bool: no mutex needed for a word-sized
+    // flag, same pattern as the task-local raw reads above.
+    std::atomic<bool> networkConnected{false};
+
     // Task-only state (only the bms task touches these, no locking needed).
     bool bleInitialized = false;
+    // First-seen timestamp of the current continuous "network connected" run.
+    // Task-only: reset to 0 on a disconnect, see bleNetworkStable().
+    int64_t bleNetStableSinceUs = 0;
     NimBLEClient* bleClient = nullptr;
     NimBLERemoteCharacteristic* cmdChar = nullptr;
     Protocol::FrameAssembler assembler;
@@ -152,6 +161,26 @@ struct Faraday::Bms::Client::Impl
         }
 
         return false;
+    }
+
+    // Pure deferral like bleHeapAvailable(): never marks bleUnavailable. Waits
+    // for a continuous network-connected run and a minimum uptime so the
+    // boot-time LAN8720 link flaps + Wi-Fi fallback cannot collide with the
+    // ~60 KB NimBLE init. Silent on purpose (initBle() logs the eventual start).
+    bool bleNetworkStable()
+    {
+        if (!networkConnected.load()) {
+            bleNetStableSinceUs = 0;
+            return false;
+        }
+
+        const int64_t now = esp_timer_get_time();
+        if (bleNetStableSinceUs == 0) {
+            bleNetStableSinceUs = now;
+        }
+
+        return (now - bleNetStableSinceUs) >= static_cast<int64_t>(BMS_BLE_NET_STABLE_MS) * 1000LL
+            && millis() >= BMS_BLE_MIN_UPTIME_MS;
     }
 
     bool initBle()
@@ -1442,6 +1471,14 @@ void Faraday::Bms::Client::run()
         }
 
         if (!impl->bleInitialized) {
+            // Automatic init waits for a stable network (boot-time link flaps +
+            // Wi-Fi fallback would OOM-abort the device while NimBLE holds its
+            // heap). Manual scans bypass this path and keep initializing BLE
+            // on demand. Pure deferral: no bleUnavailable marking.
+            if (!impl->bleNetworkStable()) {
+                impl->waitAbort(2000, generation);
+                continue;
+            }
             // Deferred (not failed): retry with the normal reconnect backoff.
             if (!impl->bleHeapAvailable(ESP.getFreeHeap())) {
                 impl->waitAbort(BMS_RECONNECT_MAX_MS, generation);
@@ -1514,6 +1551,15 @@ uint8_t Faraday::Bms::Client::cellCount() const
     const uint8_t value = _impl->cellCount;
     unlock();
     return value;
+}
+
+void Faraday::Bms::Client::setNetworkConnected(bool connected)
+{
+    if (_impl == nullptr) {
+        return;
+    }
+
+    _impl->networkConnected.store(connected);
 }
 
 void Faraday::Bms::Client::setAddress(const char* macOrNull)

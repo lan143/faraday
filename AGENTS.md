@@ -274,6 +274,7 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   `AnenjiModeSensor::update()` calls (all 23 inside the `modbusBus` block; each object gates
   its own Modbus read internally — floats staggered 10 000–18 800 ms, charging 10 s, work
   mode 10 s, the three setting modes 30 s, mode first reads staggered `800 * index` ms),
+  `Faraday::Bms::setNetworkConnected(networkMgr.isConnected())`, then
   `Faraday::Bms::update(mqttUp)` (copies the mutex-guarded BLE snapshot
   into a loop-task cache and pumps the BMS sensor objects only when the BLE link is
   connected and MQTT is ready; no RS-485 or I2C access), then an mqtt-gated non-bus block
@@ -298,8 +299,9 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
 - BMS/BLE threading: every NimBLE call runs only in the dedicated `"bms"` FreeRTOS task
   created by `Client::start()`; the loop task and AsyncTCP handlers only take the client's
   mutex-guarded snapshot/metadata (small plain-data copies, so no 200 ms bus-style guard is
-  needed). BLE init is lazy — the stack starts on the first scan request or the first
-  non-empty MAC, never at idle boot. Failed connections retry with a 5 s → 60 s exponential
+  needed). BLE init is lazy — the stack starts on the first scan request or, for a
+  non-empty MAC, once the stability gate below passes; never at idle boot. Failed connections
+  retry with a 5 s → 60 s exponential
   backoff. On connect the task performs the JBD app-key handshake on the same 0xFF02
   characteristic (`FF AA` dialect; app key `000000`, password default `123123`, published
   root-password constant). The app-key step has a 3 s response window; a pack that ignores the
@@ -318,6 +320,13 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   disconnects the BMS, runs ~10 s, and keeps up to 20 results in RAM. BLE init is additionally
   gated on `BMS_MIN_FREE_HEAP_FOR_BLE` (now 60000) so the Wi-Fi fallback can never be
   OOM-killed by the BMS domain (deferred BLE, logged, retried with the reconnect backoff);
+  automatic BLE init now ALSO waits until Ethernet/network has been continuously connected for
+  15 s and uptime is ≥15 s (`BMS_BLE_NET_STABLE_MS` / `BMS_BLE_MIN_UPTIME_MS` in
+  `src/defines.h`; `loop()` feeds `networkMgr.isConnected()` into
+  `Faraday::Bms::setNetworkConnected`, a plain atomic the bms task reads), because boot-time
+  LAN8720 PHY link flaps + ed-network's Wi-Fi fallback on the ~16 KB heap NimBLE leaves behind
+  caused a wifi-create-task NO_MEM and an lwip `tcp_receive` assert panic; a manual BMS scan
+  still initialises BLE on demand as before (the scan path bypasses the stability gate);
   the floor was lowered from 120000 because the app never reaches that much free heap after
   `setup()` (~75 KB measured on hardware), and the real BLE-up heap delta is logged
   ("BLE up, heap X->Y"). `platformio.ini` also pins

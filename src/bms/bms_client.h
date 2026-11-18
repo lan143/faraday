@@ -37,6 +37,12 @@ namespace Faraday
             void setCellCount(uint8_t count);
             uint8_t cellCount() const;
 
+            // Latest loop-task network verdict (plain atomic store, no lock).
+            // Automatic BLE init is deferred until the network has been
+            // continuously connected for BMS_BLE_NET_STABLE_MS; the manual scan
+            // path ignores this value.
+            void setNetworkConnected(bool connected);
+
             // `macOrNull` empty/NULL disables polling. The task is woken so a
             // change takes effect immediately.
             void setAddress(const char* macOrNull);

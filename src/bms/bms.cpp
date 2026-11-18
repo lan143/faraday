@@ -204,6 +204,12 @@ namespace Faraday
             }
         }
 
+        void setNetworkConnected(bool connected)
+        {
+            // Null-safe: the client ignores the store until start() ran.
+            clientInstance.setNetworkConnected(connected);
+        }
+
         Client* client()
         {
             return &clientInstance;

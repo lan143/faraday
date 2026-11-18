@@ -34,6 +34,12 @@ namespace Faraday
         // only feeds the ed-utils logger's failed-publish flood.
         void update(bool mqttReady);
 
+        // Loop-task network verdict fed into the BLE client. Automatic BLE init
+        // waits until this has been continuously true for BMS_BLE_NET_STABLE_MS
+        // (and uptime is past BMS_BLE_MIN_UPTIME_MS); the manual scan path is
+        // unaffected. Plain atomic store, safe to call every loop iteration.
+        void setNetworkConnected(bool connected);
+
         // Always-available client accessor (BLE scan, state) for the HTTP layer.
         Client* client();
 

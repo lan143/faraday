@@ -104,6 +104,15 @@
 // the boot attempt. The real BLE-up delta is measured on hardware by the
 // existing "BLE up, heap" log in src/bms/bms_client.cpp.
 #define BMS_MIN_FREE_HEAP_FOR_BLE 60000
+// Automatic BLE init additionally waits until the network (Ethernet/station) has
+// been continuously connected for this window AND uptime is past the second
+// value. The board's LAN8720 link flaps during the first ~17 s after boot and
+// ed-network then brings up the Wi-Fi fallback AP; starting NimBLE (~60 KB heap,
+// leaving ~16 KB free) inside that window aborts the device (wifi create task
+// NO_MEM -> lwip tcp_receive assert). A manual scan still initializes BLE on
+// demand as before.
+#define BMS_BLE_NET_STABLE_MS 15000
+#define BMS_BLE_MIN_UPTIME_MS 15000
 
 // Buzzer
 #define BUZZER_PIN 2

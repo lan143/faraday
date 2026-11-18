@@ -645,6 +645,9 @@ void loop()
     // guards. The BLE task owns the radio; this only pumps the RAM-backed
     // sensor objects. BLE-connected but MQTT-offline is the same log-flood
     // class as the RS-485 sensors, so skip the pump until the broker is back.
+    // The network verdict is a plain atomic store: automatic BLE init defers
+    // until it has been true for BMS_BLE_NET_STABLE_MS (boot link flaps).
+    Faraday::Bms::setNetworkConnected(networkMgr.isConnected());
     Faraday::Bms::update(mqttUp);
 
     // Basement DHT11: no RS-485 or I2C access, so its own block outside both
