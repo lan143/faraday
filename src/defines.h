@@ -28,14 +28,18 @@
 #define CHANGEOVER_RELAY_K2_CHANNEL 6 // board relay K2 (mains/generator changeover, shared with K5)
 #define CHANGEOVER_RELAY_K5_CHANNEL 3 // board relay K5 (mains/generator changeover, shared with K2)
 
-// Digital inputs sit on the PCF8574 @ INPUT_IIC_ADDRESS. The DI_n -> channel
-// mapping below is ASSUMED FORWARD (DI1 -> 0) and NOT hardware-verified — the
-// output bank was measured to be reversed, so if DI1/DI2 do not react to the
-// contacts try 7/6 instead (reverse order). Contact polarity is assumed
-// active-low (DI_CONTACT_REVERSE) — set it to false if the reported state reads
-// inverted.
+// Digital inputs sit on the PCF8574 @ INPUT_IIC_ADDRESS. The forward DI_n ->
+// channel mapping (DI1 -> 0, DI2 -> 1) is hardware-verified for the door: the
+// contact reacts on channel 0. Polarity is per-device (BinarySensor reverse):
+// the door reed wiring reads ACTIVE-HIGH — reverse=true was verified to report
+// the state inverted (closed door read as open), so DOOR_CONTACT_REVERSE is
+// false. The basement wall switch keeps the assumed active-low polarity
+// (DI_CONTACT_REVERSE); flip it to false if the light follows the switch
+// position inverted. If DI2 ever looks dead or swapped with another input,
+// try channel 6 (reverse-order mapping like the output bank).
 #define DOOR_SENSOR_INPUT_CHANNEL 0      // DI1
 #define BASEMENT_SWITCH_INPUT_CHANNEL 1  // DI2
+#define DOOR_CONTACT_REVERSE false
 #define DI_CONTACT_REVERSE true
 #define DOOR_SENSOR_POLL_INTERVAL_MS 200
 #define DOOR_SENSOR_DEBOUNCE_MS 50
@@ -45,8 +49,10 @@
 #define BASEMENT_SWITCH_POLL_INTERVAL_MS 30
 #define BASEMENT_SWITCH_DEBOUNCE_MS 50
 
-// Shared sensor/LED connector (one device at a time: DS18B20 / DHT11 / DHT21 / LED strip #2)
+// Shared sensor/LED connector (one device at a time: DS18B20 / DHT11 / DHT21 / LED strip #2).
+// The basement DHT11 climate sensor is the device currently occupying it.
 #define SENSOR_BUS_PIN 14
+#define BASEMENT_DHT_UPDATE_INTERVAL_MS 10000
 #define DS18B20_PIN SENSOR_BUS_PIN
 #define DHT_PIN SENSOR_BUS_PIN
 #define LED_STRIP2_PIN SENSOR_BUS_PIN

@@ -374,6 +374,19 @@ export function getAnenjiSettings(): Promise<ApiResult<AnenjiReadings>> {
   );
 }
 
+/**
+ * GET /api/basement — memory-only cached basement climate readings. Each value
+ * is `null` until the DHT11 has produced a first valid reading.
+ */
+export function getBasement(): Promise<
+  ApiResult<{ temperature: number | null; humidity: number | null }>
+> {
+  return getJson<{ temperature: number | null; humidity: number | null }>(
+    '/api/basement',
+    EMPTY_BODY_MESSAGE,
+  );
+}
+
 /** GET /api/settings/meter — CT ratio, sync value and live meter readings. */
 export function getMeterSettings(): Promise<ApiResult<MeterSettings>> {
   return getJson<MeterSettings>('/api/settings/meter', EMPTY_BODY_MESSAGE);

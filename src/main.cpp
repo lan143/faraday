@@ -22,6 +22,9 @@
 #include <sensor/anenji_sensor.h>
 #include <sensor/anenji_charging_state.h>
 #include <sensor/anenji_mode_sensor.h>
+#include <sensor/dht11_sensor.h>
+#include <sensor/dht11_temperature.h>
+#include <sensor/dht11_humidity.h>
 #include <relay/pcf8574.h>
 #include <light/relay_light.h>
 #include <binary_sensor/pcf8574.h>
@@ -84,6 +87,12 @@ EDCommon::Sensor::Sensor* supplierEnergyPower = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyReactivePower = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyFrequency = nullptr;
 
+// Basement climate: a DHT11 on the shared GPIO14 connector. The two sensor
+// objects share one driver instance, so one physics read feeds both per cycle.
+EDCommon::Sensor::DHT11Sensor basementDht(DHT_PIN);
+EDCommon::Sensor::Sensor* basementTemperature = nullptr;
+EDCommon::Sensor::Sensor* basementHumidity = nullptr;
+
 PCF8574 relayExp(RELAY_IIC_ADDRESS);
 PCF8574 inputExp(INPUT_IIC_ADDRESS);
 
@@ -106,7 +115,7 @@ EDCommon::Light::Relay entranceLight(&entranceLightRelay);
 EDCommon::BinarySensor::PCF8574P doorSensor(
     DOOR_SENSOR_INPUT_CHANNEL,
     EDHA::deviceClassBinarySensorDoor,
-    DI_CONTACT_REVERSE,
+    DOOR_CONTACT_REVERSE,
     &inputExp,
     DOOR_SENSOR_DEBOUNCE_MS
 );
@@ -440,6 +449,24 @@ void setup()
         }
     }
 
+    LOGI("setup", "init basement DHT11");
+    basementDht.begin();
+    basementTemperature = new EDCommon::Sensor::DHT11Temperature(&basementDht);
+    if (!basementTemperature->init(1, BASEMENT_DHT_UPDATE_INTERVAL_MS, {
+            EDCommon::Sensor::withMQTT(&mqtt, mqttPrefix, "faraday", "Basement temperature"),
+            EDCommon::Sensor::withDiscovery(&discoveryMgr, device),
+        })) {
+        LOGE("setup", "failed to init basement temperature sensor");
+    }
+    basementHumidity = new EDCommon::Sensor::DHT11Humidity(&basementDht);
+    if (!basementHumidity->init(0, BASEMENT_DHT_UPDATE_INTERVAL_MS, {
+            EDCommon::Sensor::withMQTT(&mqtt, mqttPrefix, "faraday", "Basement humidity"),
+            EDCommon::Sensor::withDiscovery(&discoveryMgr, device),
+        })) {
+        LOGE("setup", "failed to init basement humidity sensor");
+    }
+    handler.setBasementSensors(basementTemperature, basementHumidity);
+
     Faraday::Bms::init(&mqtt, &discoveryMgr, device, mqttPrefix);
     handler.setBms(Faraday::Bms::client());
 
@@ -619,6 +646,15 @@ void loop()
     // sensor objects. BLE-connected but MQTT-offline is the same log-flood
     // class as the RS-485 sensors, so skip the pump until the broker is back.
     Faraday::Bms::update(mqttUp);
+
+    // Basement DHT11: no RS-485 or I2C access, so its own block outside both
+    // guards. The two sensors share the driver's 2 s cache, so one physical
+    // read per cycle. Same offline rule as the other domains: no destination,
+    // no pump.
+    if (mqttUp) {
+        if (basementTemperature) basementTemperature->update();
+        if (basementHumidity) basementHumidity->update();
+    }
 
     // Cheap, no bus access: derive the electricity state from the last valid
     // L1 voltage reading and publish it retained on change. getValue() only

@@ -36,6 +36,11 @@ namespace EDCommon
     {
         class Light;
     }
+
+    namespace Sensor
+    {
+        class Sensor;
+    }
 }
 
 namespace Faraday
@@ -65,6 +70,7 @@ public:
     void setAnenji(EDWB::ANENJI4200* anenji);
     void setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::Light* light, EDCommon::Light::Light* entranceLight, EDCommon::Relay::Relay* generator);
     void setBms(Faraday::Bms::Client* client);
+    void setBasementSensors(EDCommon::Sensor::Sensor* temperature, EDCommon::Sensor::Sensor* humidity);
 
 private:
     void registerLogSettingsHandlers();
@@ -73,10 +79,12 @@ private:
     void registerAnenjiSettingsHandlers();
     void registerControlHandlers();
     void registerBmsHandlers();
+    void registerBasementHandlers();
     void sendModbusSettingsState(AsyncWebServerRequest* request, int status);
     void sendMeterSettingsState(AsyncWebServerRequest* request, int status);
     void sendAnenjiSettingsState(AsyncWebServerRequest* request, int status);
     void sendBmsState(AsyncWebServerRequest* request, int status);
+    void sendBasementState(AsyncWebServerRequest* request, int status);
     // Each pair is <hasValue, value>; a missing value is serialized as null
     // (used when the shared relay bus cannot be locked for a readback).
     void sendControlsState(
@@ -96,6 +104,8 @@ private:
     EDWB::MAP12E* _map12e = nullptr;
     EDWB::ANENJI4200* _anenji = nullptr;
     Faraday::Bms::Client* _bms = nullptr;
+    EDCommon::Sensor::Sensor* _basementTemperature = nullptr;
+    EDCommon::Sensor::Sensor* _basementHumidity = nullptr;
     EDCommon::Relay::Relay* _ventilationRelay = nullptr;
     EDCommon::Light::Light* _light = nullptr;
     EDCommon::Light::Light* _entranceLight = nullptr;

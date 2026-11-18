@@ -39,7 +39,9 @@ from a built-in BLE scan, and a configurable 1–20 cell count makes a 12S pack 
 factory/EEPROM-mode counter clear (reg `0x00` enter, reg `0x01` exit-with-clear; the sequence
 is hardware-verified on `SP22S003AP21S50A` (FW 7.6)); commands may require the JBD app-key
 handshake, and there are no
-MOSFET/balancer writes. There is **no automatic** network↔generator switching yet — `src/automation/` is where that
+MOSFET/balancer writes. A **basement climate** domain reads a DHT11 on the shared GPIO14
+connector and publishes temperature/humidity to MQTT + Home Assistant (no config fields, no
+control). There is **no automatic** network↔generator switching yet — `src/automation/` is where that
 logic will go.
 There is still **no domain logic** for GSM, RF433, LED strips, analog inputs, RS-485 devices
 other than the WB-MAP12E and the Anenji 4200, or the buzzer beyond the boot beep. Those pins
@@ -68,12 +70,17 @@ excluded (`AsyncTCP` is the ESP32 stack). Keep both entries when editing `lib_de
 
 `lib_deps` also includes `h2zero/NimBLE-Arduino@==1.4.3` for the BMS BLE domain and
 `adafruit/Adafruit NeoPixel@==1.12.3` for the single-pixel status LED (`STATUS_LED_PIN`
-GPIO12, GRBW type); the `lib_ignore` rule above is unchanged.
+GPIO12, GRBW type). The basement DHT11 support comes from `ed-common`, whose `library.json`
+declares `adafruit/DHT sensor library` 1.4.7 (with its transitive
+`Adafruit Unified Sensor` 1.1.15) — it is no longer a direct `lib_deps` pin; the
+`lib_ignore` rule above is unchanged.
 
-`lib_deps` pins `ed-common` to tag `0.7.0` (`https://github.com/lan143/ed-common#0.7.0`),
-which adds `BinarySensor::PCF8574P` (debounced input-expander binary sensor), the
-`Light::withWallSwitch` binding and offline publish guards. Builds are reproducible from the
-repo alone again.
+`lib_deps` pins `ed-common` to tag `0.8.0` (`https://github.com/lan143/ed-common#0.8.0`),
+which keeps the 0.7.0 additions — `BinarySensor::PCF8574P` (debounced input-expander binary
+sensor), the `Light::withWallSwitch` binding and offline publish guards — and adds the
+`Sensor::DHTSensor` base with the `DHT11Sensor`/`DHT22Sensor` drivers and the
+`DHT11Temperature`/`DHT22Temperature`/`DHT11Humidity`/`DHT22Humidity` sensor wrappers.
+Builds are reproducible from the repo alone again.
 
 OTA target and auth come from the **untracked** project-root `/.env` (copy `.env.example`):
 `FARADAY_OTA_IP` and `FARADAY_OTA_AUTH`. `scripts/ota_env.py` injects them into
@@ -136,10 +143,10 @@ src/
 │   ├── anenji_charging_state.h/.cpp  Faraday::BatteryChargingState: HA binary_sensor from register 232 sign
 │   └── anenji_mode_sensor.h/.cpp  Faraday::AnenjiModeSensor: four plain text-state HA sensors (work/output mode, output/charge priority) + single-source `label()`
 └── web/
-    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/anenji/bms/controls routes
+    ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/anenji/bms/basement/controls routes
     ├── backup_specs.h       BackupFileSpec table + /api/config handler configs
     └── reboot_after_response.h  Deferred reboot after the HTTP response is flushed
-frontend/                    Preact + TypeScript + Vite SPA sources (tabs incl. Modbus/Meter/Anenji); npm run build -> data/
+frontend/                    Preact + TypeScript + Vite SPA sources (tabs incl. Modbus/Meter/Anenji/Basement); npm run build -> data/
 data/                        Built web UI served from LittleFS (index.html + assets/)
 scripts/
 ├── ota_env.py               Injects .env OTA IP/auth into env:faraday_ota
@@ -153,8 +160,8 @@ Makefile                     OTA deploy orchestration (deploy/backup/restore/sta
 `data/` is build output from `frontend/` — edit the frontend source, not the bundle.
 `frontend/package.json` pulls the network/config/log web components from the sibling
 `ed-network`, `ed-config` and `ed-utils` packages via `file:../../…/frontend` dependencies;
-the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.tsx`,
-`Anenji.tsx`, `Bms.tsx`) are local pages.
+the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx`,
+`Meter.tsx`, `Anenji.tsx`, `Bms.tsx`, `Basement.tsx`) are local pages.
 
 ## Architecture
 
@@ -166,7 +173,9 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   `…Frequency`), `anenji` (`EDWB::ANENJI4200*`) + twelve `Faraday::AnenjiSensor*` telemetry
   pointers + `Faraday::BatteryChargingState anenjiCharging` + four `Faraday::AnenjiModeSensor`
   objects (`anenjiWorkModeSensor`, `anenjiOutputModeSensor`, `anenjiOutputPrioritySensor`,
-  `anenjiChargePrioritySensor`), two `PCF8574`
+  `anenjiChargePrioritySensor`), `EDCommon::Sensor::DHT11Sensor basementDht(DHT_PIN)` + two
+  `EDCommon::Sensor::Sensor*` basement pointers (`basementTemperature`, `basementHumidity`),
+  two `PCF8574`
   objects (`0x24` relay, `0x22` input), three `EDCommon::Relay::PCF8574P` objects
   (`ventilationRelay`, `lightRelay`, `entranceLightRelay`, all over `relayExp`),
   `EDCommon::Light::Relay light` (wraps `lightRelay`, carries the wall-switch binding) and
@@ -211,6 +220,10 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   `init()` (binary_sensor; disabled together with the sensors when `anenjiAddress == 0`, so
   nothing is created or wired) → four `AnenjiModeSensor` `setDevice()` + `init(..., index
   0..3)` calls (plain text-state HA sensors; first read staggered `800 * index` ms) →
+  `basementDht.begin()` + two `EDCommon::Sensor::DHT11Temperature`/`DHT11Humidity` objects
+  (`init(1|0, 10 s, {MQTT "Basement temperature"|"Basement humidity" + discovery})`, `LOGE`
+  on failure) + `handler.setBasementSensors()` — the two objects share the one driver, so
+  each cycle is a single physical read →
   `Faraday::Bms::init(&mqtt, &discoveryMgr, device, mqttPrefix)` +
   `handler.setBms(Faraday::Bms::client())` (starts the `"bms"` task; with an empty BMS MAC it
   creates no sensors and the BLE stack stays dormant) → a `controlBus`-guarded block that
@@ -263,7 +276,9 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   mode 10 s, the three setting modes 30 s, mode first reads staggered `800 * index` ms),
   `Faraday::Bms::update(mqttUp)` (copies the mutex-guarded BLE snapshot
   into a loop-task cache and pumps the BMS sensor objects only when the BLE link is
-  connected and MQTT is ready; no RS-485 or I2C access), then the
+  connected and MQTT is ready; no RS-485 or I2C access), then an mqtt-gated non-bus block
+  pumping the two basement DHT11 sensors (`basementTemperature`/`basementHumidity`, no
+  Modbus/I2C guard; Adafruit's 2 s cache means one physical read per cycle), then the
   electricity-status evaluation/publish
   (outside the `modbusBus` block — `getValue()` is not bus access), then
   `networkLogger.update()`. When `inited`
@@ -342,6 +357,10 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
     HA discovery incl. `state_class`) and header-only `WBMAP12E*` subclasses plus the local
     header-only `Faraday::` subclasses `WBMAP12EReactivePower` and `AnenjiSensor`. The energy
     sensor emulates a resettable counter with `energySyncValue` + (device − `energyMeterBase`).
+    The DHT family (`Sensor::DHTSensor` base with the header-only `DHT11Sensor`/`DHT22Sensor`
+    drivers over the Adafruit DHT library, plus the `DHT11Temperature`/`DHT22Temperature`/
+    `DHT11Humidity`/`DHT22Humidity` numeric sensors carrying unit/device class) is used for
+    the basement climate pair.
     Also `EDCommon::Relay::PCF8574P` (channel + shared PCF8574 driver; active-low ON = `LOW`
     is hardcoded in it) and `EDCommon::Light::Relay` (light facade over a backing relay):
     their `init()` auto-subscribes the MQTT command topic and registers the HA switch/light
@@ -439,7 +458,12 @@ the Modbus, Meter, Anenji and BMS tabs (`frontend/src/pages/Modbus.tsx`, `Meter.
   published on change with a 60 s retained heartbeat, a failed read holds the last label,
   failed publishes stay pending and are retried, and nothing is published before the first
   valid read. Work mode (register 201) is polled every 10 s, the three setting registers
-  (output mode 300, output priority 301, charge priority 331) every 30 s. When a BMS MAC is
+  (output mode 300, output priority 301, charge priority 331) every 30 s. The basement DHT11
+  registers two numeric sensors on the same device and publishes retained plain values on
+  `faraday/<chip>/basement_temperature/state` (`°C`, `device_class temperature`, 1 decimal)
+  and `faraday/<chip>/basement_humidity/state` (`%`, `device_class humidity`, integer), each
+  with a 60 s heartbeat; nothing is published before the first valid read, and a failed read
+  holds the last value. When a BMS MAC is
   configured at boot, the BMS domain registers 14 numeric `measurement`-class sensors on
   `faraday/<chip>/bms_{state_of_charge,total_voltage,current,power,capacity_remaining,
   nominal_capacity,charging_cycles,min_cell_voltage,max_cell_voltage,avg_cell_voltage,
@@ -500,6 +524,7 @@ the config/backup routes take raw bodies.
 | `/api/settings/meter` | GET | JSON `{ct1Ratio, energySyncValue, energyMeterBase, meterEnergy, supplierEnergy}`; the two live readings are `null` while the meter is unreachable or the bus guard times out (still 200) |
 | `/api/settings/meter` | POST | JSON (max 1024 B), at least one of `ct1Ratio` (0–65535) / `energySyncValue` (≥0); device CT write and/or energy read happen **before** store, so 500 `{"message":"meter unreachable"}` aborts without persisting (a bus-guard timeout takes the same path); 422 field errors; 200 returns the refreshed state |
 | `/api/settings/anenji` | GET | Always 200 `{enabled, mainsVoltage, mainsCurrent, mainsPower, outputVoltage, outputCurrent, outputPower, batteryVoltage, batteryCurrent, batteryPower, batteryCharging, pvVoltage, pvCurrent, pvPower, workMode, outputMode, outputPriority, chargePriority}`; every reading is `null` when the inverter is disabled (`anenjiAddress == 0` or `setAnenji()` never wired), the 200 ms `modbusBus` guard times out, or the fast-fail probe fails (a failed first `getMainsVoltage` read skips the remaining 15 reads); on the reachable path each field is `null` iff its own read failed; `batteryCharging` is `bool\|null` from the register 232 sign (0/failed → `null`); the four mode fields are `string\|null` labels from `AnenjiModeSensor::label` (`"Unknown"` for unmapped enum values) with the same null semantics as the other readings; read-only — no POST on this route |
+| `/api/basement` | GET | Always 200 `{temperature, humidity}` from the cached EDCommon sensor pair (`getValue()`; memory only, no bus access). Each value is a rounded `number` or `null` while unwired or before the first valid DHT11 read; no POST |
 | `/api/bms` | GET | Always 200 when wired: `{enabled, bleUnavailable, mac, cellCount, connected, lastUpdateMs, reportedCellCount, status, errors, deviceModel, soc, totalVoltage, current, power, capacityRemaining, nominalCapacity, cycles, swVersion, mosfetBitmask, protectionBitmask, balancerBitmask, temperatures, cells, errorCounts, clearGeneration, clearPending, clearResult, authState}`; `mac` is `""` when unset; every reading is `null` until the first valid JBD frame; `cells` has exactly `cellCount` entries; `errorCounts` is `null` or 11 integer keys; `clearResult` stays `null` until a clear completes, then `"sent"` (no ack within the timeout), `"acked"` or `"failed"`; `clearPending` is `true` while the BLE task is executing the clear command; `authState` is `"not-authenticated"`, `"authenticating"`, `"authenticated"` or `"failed"`; 500 `{"message":"bms not initialized"}` before `handler.setBms()` wiring |
 | `/api/bms/settings` | POST | JSON (max 1024 B), both `mac` (empty disables; otherwise normalized `AA:BB:CC:DD:EE:FF`) and `cellCount` (1..20) required; 422 `{"message":"<field>: required\|invalid value"}`, 500 `{"message":"failed to store config"\|"bms not initialized"}`, 200 returns the full refreshed BMS state; MAC/cell count apply live to BLE polling, MQTT/HA discovery changes need a reboot |
 | `/api/bms/scan/start` | POST | Starts the ~10 s BLE scan; 200 `{}`, 422 `{"message":"scan already running"}`, 500 `{"message":"bms not initialized"}`; disconnects the BMS while scanning |
@@ -563,8 +588,11 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   list rather than appending. `env:faraday_ota` intentionally does not redefine it; if you
   add flags there, copy the whole list or the parent flags disappear.
 - **GPIO14 is a shared connector**: `SENSOR_BUS_PIN`, `DS18B20_PIN`, `DHT_PIN` and
-  `LED_STRIP2_PIN` all alias it. Connect **one** device at a time (DS18B20 / DHT11 / DHT21 /
-  LED strip #2); there is no multiplexer.
+  `LED_STRIP2_PIN` all alias it. A **DHT11** is the device currently connected (the basement
+  climate sensor); still connect **one** device at a time (DS18B20 / DHT11 / DHT21 /
+  LED strip #2), there is no multiplexer. The DHT11 accuracy is about ±2 °C / ±5 % RH and the
+  Adafruit driver's 2 s cache means the two sensor objects share one physical read per 10 s
+  cycle.
 - **GPIO12 (`STATUS_LED_PIN`, WS2812 RGBW) and GPIO2 (`BUZZER_PIN`) are boot-strapping
   pins.** The single on-board status pixel is now actively driven (health green/yellow/red),
   so an external LED-strip load present at boot can prevent the ESP32 from starting; verify
@@ -631,8 +659,9 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 - After a config reset the Modbus defaults are already usable (meter address 1, inverter
   disabled at 0), so no address edit is required for the meter — but a previously enabled
   inverter must be re-enabled (`anenjiAddress` set + reboot) after a `/config.bin` wipe.
-- `ed-wb` and `ed-common` are git-pinned (`ed-wb#dfa808b1…`, `ed-common#0.7.0`); the WB-MAP12E
-  support and the sensor family ship in those releases; `lib_ignore = ESPAsyncTCP, RPAsyncTCP`
+- `ed-wb` and `ed-common` are git-pinned (`ed-wb#dfa808b1…`, `ed-common#0.8.0`); the WB-MAP12E
+  support, the sensor family and the DHT11/DHT22 drivers ship in those releases;
+  `lib_ignore = ESPAsyncTCP, RPAsyncTCP`
   must stay or a clean resolve pulls the wrong TCP stacks.
 - `cd frontend && npm run build` uses Vite `emptyOutDir: true` and **rewrites `data/`**,
   deleting untracked fixtures. Re-run `-t uploadfs` (or `make ui`/`make deploy`) to get the
@@ -730,12 +759,16 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   register a duplicate HA switch next to the light entity; only the `light` facade owns the
   topics. `entranceLightRelay` follows the same backing/facade split (no options; the
   `entranceLight` facade owns `faraday/<chip>/entrance_light/state|set` and the HA entity).
-- The DI_n → PCF8574 channel mapping is **assumed forward** (`DI1` → channel 0, `DI2` →
-  channel 1) and the contact polarity is **assumed active-low** (`DI_CONTACT_REVERSE = true`) —
-  both are **hardware-unverified**. The output bank was measured reversed, so if DI1/DI2 do not
-  react to the contacts try `7`/`6` (reverse order) in `src/defines.h`; if the reported door
-  state reads inverted, flip `DI_CONTACT_REVERSE` instead. The channel/polarity constants are
-  `DOOR_SENSOR_INPUT_CHANNEL`, `BASEMENT_SWITCH_INPUT_CHANNEL`, `DI_CONTACT_REVERSE`.
+- The forward DI_n → PCF8574 channel mapping is **hardware-verified for the door** (`DI1` →
+  channel 0 — the contact reacts; only the polarity was wrong). The door reed wiring reads
+  **active-high**, verified on hardware: with `true` the closed door read as open, so
+  `DOOR_CONTACT_REVERSE = false` in `src/defines.h`. The basement wall switch keeps the
+  **assumed** active-low polarity (`DI_CONTACT_REVERSE`, flip it to `false` if the light
+  follows the switch position inverted) and its forward channel is still an assumption — if
+  DI2 ever looks dead or swapped with another input, try channel `6` (reverse-order mapping
+  like the output bank). The channel/polarity constants are
+  `DOOR_SENSOR_INPUT_CHANNEL`, `BASEMENT_SWITCH_INPUT_CHANNEL`, `DOOR_CONTACT_REVERSE`,
+  `DI_CONTACT_REVERSE`.
 - The latching basement wall switch drives the light only: its debounce is 50 ms and the
   `Light::withWallSwitch` poll gate runs every 30 ms, so a press reacts in ≈ debounce 50 ms +
   ≤30 ms poll + one loop iteration. It publishes nothing and never depends on MQTT, so the

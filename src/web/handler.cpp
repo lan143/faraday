@@ -8,6 +8,7 @@
 #include <relay/relay.h>
 #include <light/light.h>
 #include <sensor/anenji_mode_sensor.h>
+#include <sensor/sensor.h>
 #include <wirenboard.h>
 #include <algorithm>
 #include <cstring>
@@ -124,6 +125,7 @@ void Handler::init()
     registerMeterSettingsHandlers();
     registerAnenjiSettingsHandlers();
     registerControlHandlers();
+    registerBasementHandlers();
     registerBmsHandlers();
 
     _networkApi->registerRoutes(*_server);
@@ -421,6 +423,12 @@ void Handler::setControls(EDCommon::Relay::Relay* ventilation, EDCommon::Light::
 void Handler::setBms(Faraday::Bms::Client* client)
 {
     _bms = client;
+}
+
+void Handler::setBasementSensors(EDCommon::Sensor::Sensor* temperature, EDCommon::Sensor::Sensor* humidity)
+{
+    _basementTemperature = temperature;
+    _basementHumidity = humidity;
 }
 
 void Handler::sendModbusSettingsState(AsyncWebServerRequest* request, int status)
@@ -1098,6 +1106,51 @@ void Handler::registerControlHandlers()
     postHandler->setMethod(HTTP_POST);
     postHandler->setMaxContentLength(1024);
     _server->addHandler(postHandler);
+}
+
+// Response contract: {temperature, humidity}. Both are memory-only cached
+// reads from the EDCommon sensor pair (never a device read from this task):
+// null while the pointer is unwired or the cached pair is invalid, i.e. before
+// the first valid DHT11 read.
+void Handler::sendBasementState(AsyncWebServerRequest* request, int status)
+{
+    std::pair<float_t, bool> temperature = {0.0f, false};
+    std::pair<float_t, bool> humidity = {0.0f, false};
+
+    if (_basementTemperature != nullptr) {
+        temperature = _basementTemperature->getValue();
+    }
+
+    if (_basementHumidity != nullptr) {
+        humidity = _basementHumidity->getValue();
+    }
+
+    AsyncResponseStream* response = request->beginResponseStream("application/json");
+    response->setCode(status);
+
+    std::string payload = EDUtils::buildJson([temperature, humidity](JsonObject entity) {
+        if (temperature.second) {
+            entity["temperature"] = temperature.first;
+        } else {
+            entity["temperature"] = nullptr;
+        }
+
+        if (humidity.second) {
+            entity["humidity"] = humidity.first;
+        } else {
+            entity["humidity"] = nullptr;
+        }
+    });
+
+    response->write(payload.c_str());
+    request->send(response);
+}
+
+void Handler::registerBasementHandlers()
+{
+    _server->on("/api/basement", HTTP_GET, [this](AsyncWebServerRequest* request) {
+        sendBasementState(request, 200);
+    });
 }
 
 // Response contract: {enabled, bleUnavailable, mac, cellCount, connected,

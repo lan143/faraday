@@ -8,6 +8,7 @@ import { MqttPage } from './pages/Mqtt';
 import { ModbusPage } from './pages/Modbus';
 import { MeterPage } from './pages/Meter';
 import { AnenjiPage } from './pages/Anenji';
+import { BasementPage } from './pages/Basement';
 import { BmsPage } from './pages/Bms';
 import { ConfigPage } from './pages/Config';
 import { LoggerSettingsPage } from './pages/Logger';
@@ -21,6 +22,7 @@ type TabId =
   | 'meter'
   | 'anenji'
   | 'bms'
+  | 'basement'
   | 'config'
   | 'logger';
 
@@ -33,6 +35,7 @@ const TABS: ReadonlyArray<TabItem<TabId>> = [
   { id: 'meter', label: 'Meter' },
   { id: 'anenji', label: 'Anenji' },
   { id: 'bms', label: 'BMS' },
+  { id: 'basement', label: 'Basement' },
   { id: 'config', label: 'Config' },
   { id: 'logger', label: 'Log' },
 ];
@@ -55,6 +58,8 @@ function renderPanel(tab: TabId) {
       return <AnenjiPage />;
     case 'bms':
       return <BmsPage />;
+    case 'basement':
+      return <BasementPage />;
     case 'config':
       return <ConfigPage />;
     case 'logger':
