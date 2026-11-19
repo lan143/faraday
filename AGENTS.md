@@ -14,7 +14,7 @@ single-pixel status LED as a health indicator (green = ok, yellow = warning, red
 probes two PCF8574 expanders, reads a WB-MAP12E energy meter over Modbus RTU on RS-485, reads
 a JBD BMS over BLE, and emits one boot beep.
 
-Six domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
+Eight domains now exist: a **WB-MAP12E single-phase (channel 1 / L1)** energy meter exposing
 voltage, current, active power, reactive power, frequency and a software-offset supplier
 energy counter, plus CT-ratio and supplier-sync settings; **relay control** — light and
 ventilation on the KC868-A8S relay bank through the PCF8574 output expander at `0x24`, plus a
@@ -41,10 +41,24 @@ is hardware-verified on `SP22S003AP21S50A` (FW 7.6)); commands may require the J
 handshake, and there are no
 MOSFET/balancer writes. A **basement climate** domain reads a DHT11 on the shared GPIO14
 connector and publishes temperature/humidity to MQTT + Home Assistant (no config fields, no
-control). There is **no automatic** network↔generator switching yet — `src/automation/` is where that
+control). A **Saifuli MTD262-MB presence/illuminance** sensor joins the same RS-485 bus
+(Modbus address `presenceAddress`, default 0 = the sensor **and** the basement light
+automation disabled, reboot to apply, mirrors `anenjiAddress`; input registers only — holding
+registers are never written): presence is one HA binary_sensor "Presence" (retained
+`true`/`false` on `faraday/<chip>/presence/state`, `device_class occupancy`) and illuminance
+is an internal-only lux cache (no MQTT topic, no HA entity), polled every 10 s on the bus but
+currently **unconsumed** — no HA entity, no MQTT topic, and it is NOT fed to the **basement
+light automation** — the first use of ed-common's `EDCommon::Automation::Light` — which turns
+the light ON while (human presence OR door open), illuminance deliberately having **no
+influence on the automation** (explicit owner decision — do not reintroduce a lux gate), and
+OFF on the next 500 ms pass once the composite drops. No night mode,
+no MQTT topics, no HA entities, no hold-time config; a sustained wall-switch/HA change is
+adopted after ~3 s and parks the automation in manual mode for 5 min (light left ON) or
+until 10 min after human-absent (light left OFF). The automation runs while the broker is
+down. There is **no automatic** network↔generator switching yet — `src/automation/` is where that
 logic will go.
 There is still **no domain logic** for GSM, RF433, LED strips, analog inputs, RS-485 devices
-other than the WB-MAP12E and the Anenji 4200, or the buzzer beyond the boot beep. Those pins
+other than the WB-MAP12E, the Anenji 4200 and the MTD262-MB, or the buzzer beyond the boot beep. Those pins
 and objects are reserved for the next waves; do not describe them as working features. Target
 hardware is a generic 4 MB ESP32 + LAN8720 dev-board class;
 `src/defines.h` declares model `ESP32-LAN8720`, with board revision **TBD**. PlatformIO board
@@ -118,8 +132,8 @@ any authorized reboot that relays will drop.
 
 Partition layout (`partitions.csv`): two app slots `0x1D0000` = 1,900,544 B (~1.81 MiB) each
 at `0x10000` / `0x1E0000`, and the LittleFS `spiffs` data slot at `0x3B0000` with size
-`0x50000` = 327,680 B (320 KiB). The current firmware is 1,495,120 B
-(~1.43 MiB / ~1.50 MB, 78.7% of an app slot); `data/` is ~164 KiB (`du -sk data`). `make` warns when `data/`
+`0x50000` = 327,680 B (320 KiB). The current firmware is 1,510,853 B
+(79.5% of an app slot; `firmware.bin` 1,517,424 B); `data/` is 172 KB after rebuild. `make` warns when `data/`
 exceeds 262,144 B (80% of the 327,680 B slot) but still attempts the upload; the device
 reports the real failure.
 
@@ -146,12 +160,16 @@ src/
 │   ├── device_health.h/.cpp Three ed-healthcheck Ready adapters: self-throttled Modbus probes for the WB-MAP12E and Anenji 4200, BMS snapshot warnings/faults
 │   └── status_led.h/.cpp    Single-pixel health LED: green ok / yellow warning / red error, painted only on change
 ├── automation/
-│   └── automation.h/.cpp    Mains/generator changeover: two MQTT-less PCF8574P backing relays + Relay-derived facade owning topics/discovery; future switching logic
+│   ├── automation.h/.cpp    Mains/generator changeover: two MQTT-less PCF8574P backing relays + Relay-derived facade owning topics/discovery; future switching logic
+│   └── basement_light.h/.cpp  Basement light automation: composite occupancy source (presence OR door) + ed-common Automation::Light wiring, /light_state.bin cleanup at init
+├── migration/
+│   └── config_migration.h/.cpp  Boot migration v5→v6: frozen ConfigV5 replica, exact-size + CRC16 legacy /config.bin reader, field-by-field apply
 ├── sensor/
 │   ├── wb_map12e_reactive_power.h  Local Faraday::WBMAP12EReactivePower (not yet in ed-common)
 │   ├── anenji_sensor.h      Faraday::AnenjiSensor: 12 read-only Anenji 4200 telemetry quantities on EDCommon::Sensor
 │   ├── anenji_charging_state.h/.cpp  Faraday::BatteryChargingState: HA binary_sensor from register 232 sign
-│   └── anenji_mode_sensor.h/.cpp  Faraday::AnenjiModeSensor: four plain text-state HA sensors (work/output mode, output/charge priority) + single-source `label()`
+│   ├── anenji_mode_sensor.h/.cpp  Faraday::AnenjiModeSensor: four plain text-state HA sensors (work/output mode, output/charge priority) + single-source `label()`
+│   └── mtd262mb_illuminance.h/.cpp  Faraday::MTD262MBIlluminance (input reg 0x01, s16 × 0.1 lux, clamped ≥0) + internal-only Faraday::MTD262IlluminanceSensor cache (no options, no topics/entities)
 └── web/
     ├── handler.h/.cpp       AsyncWebServer :80; static UI, settings/status/log/modbus/meter/anenji/bms/basement/controls routes
     ├── backup_specs.h       BackupFileSpec table + /api/config handler configs
@@ -185,7 +203,9 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   objects (`anenjiWorkModeSensor`, `anenjiOutputModeSensor`, `anenjiOutputPrioritySensor`,
   `anenjiChargePrioritySensor`), `EDCommon::Sensor::DHT11Sensor basementDht(DHT_PIN)` + two
   `EDCommon::Sensor::Sensor*` basement pointers (`basementTemperature`, `basementHumidity`),
-  two `PCF8574`
+  three presence pointers (`Faraday::MTD262MBIlluminance* presenceDevice`,
+  `EDCommon::BinarySensor::MTD262MB* presenceSensor`, `Faraday::MTD262IlluminanceSensor*
+  presenceLux` — all `nullptr` until `presenceAddress > 0`), two `PCF8574`
   objects (`0x24` relay, `0x22` input), three `EDCommon::Relay::PCF8574P` objects
   (`ventilationRelay`, `lightRelay`, `entranceLightRelay`, all over `relayExp`),
   `EDCommon::Light::Relay light` (wraps `lightRelay`, carries the wall-switch binding) and
@@ -197,6 +217,10 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   (`meterHealth`, `inverterHealth`, `bmsHealth`; see `src/health/`). The mains/generator changeover objects (two `EDCommon::Relay::PCF8574P` backing
   relays over `relayExp` and a `Relay`-derived `GeneratorChangeover` facade) live at file
   scope in `src/automation/automation.cpp`, which `extern`s `relayExp` — not in `main.cpp`.
+  The basement light automation objects (the static composite `OccupancySource` and the
+  `EDCommon::Automation::Light*`) live at file scope in `src/automation/basement_light.cpp`;
+  `main.cpp` only calls `Faraday::Automation::initBasementLight()` / `updateBasementLight()`
+  inside the guarded blocks.
   The BMS objects (NimBLE client, dedicated task state, snapshot cache and sensor vectors) live
   at file scope in `src/bms/bms.cpp`, again not in `main.cpp`; `main.cpp` only calls
   `Faraday::Bms::init()` / `Faraday::Bms::update()` and `handler.setBms()`.
@@ -204,7 +228,12 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   (create + give each, so both guards boot unlocked) → `Serial` (115200) → runtime esp_log level
   set to INFO (see the NetworkLogger gotcha) →
   LittleFS mount
-  (early return on failure) → config defaults → `configMgr.load()` → network logger init →
+  (early return on failure) → config defaults → legacy v5 snapshot read
+  (`readLegacyConfigV5()` BEFORE `load()` — a size/CRC mismatch makes `load()` fall back to
+  defaults and clobber the file; every failure path logs `LOGW` and is inert) →
+  `configMgr.load()` → when a legacy snapshot was read: `applyLegacyConfigV5()` +
+  `configMgr.store()` (boot migration v5→v6: v5 fields copied field-by-field, the two new
+  fields get their defaults, `version` stays 6) → network logger init →
   `Serial2.begin(config->modbusSpeed, …)` (RS-485) + `modbus.init(15)` → `Serial1` (GSM
   placeholder) → `Wire` at 100 kHz → PCF8574 probes (relay probe result stored in the
   `relayExpPresent` flag, input probe in `inputExpPresent`) → `networkMgr.init(..., hasEth=true, ...)`
@@ -233,7 +262,15 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   `basementDht.begin()` + two `EDCommon::Sensor::DHT11Temperature`/`DHT11Humidity` objects
   (`init(1|0, 10 s, {MQTT "Basement temperature"|"Basement humidity" + discovery})`, `LOGE`
   on failure) + `handler.setBasementSensors()` — the two objects share the one driver, so
-  each cycle is a single physical read →
+  each cycle is a single physical read → when `config->presenceAddress > 0`:
+  `new Faraday::MTD262MBIlluminance(*modbus.getClient())` + `init(address)` (the shared
+  `ModbusClient`, deliberately NOT registered via `modbus.addMTD262MB()`, so no WirenBoard
+  device-list entry; input registers only) → `presenceSensor` = `EDCommon::BinarySensor::MTD262MB`
+  with `init(PRESENCE_SENSOR_POLL_INTERVAL_MS, {MQTT "Presence" + discovery})` → `presenceLux`
+  = `Faraday::MTD262IlluminanceSensor` with `init(1, PRESENCE_LUX_POLL_INTERVAL_MS, {})`
+  (no options: internal lux cache, currently unconsumed — no topic, no HA entity, not fed to
+  the automation); at address 0 only a `LOGI`
+  "presence sensor disabled" runs and no device/sensor/automation exists →
   `Faraday::Bms::init(&mqtt, &discoveryMgr, device, mqttPrefix)` +
   `handler.setBms(Faraday::Bms::client())` (starts the `"bms"` task; with an empty BMS MAC it
   creates no sensors and the BLE stack stays dormant) → a `controlBus`-guarded block that
@@ -253,6 +290,14 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   mqttPrefix)` (the two backing changeover relays first with empty options, then the facade
   with `withMQTT(..., "Generator")` + `withDiscovery`, which auto-subscribes
   `faraday/<chip>/generator/set` and registers one HA switch on the same device), then
+  `Faraday::Automation::initBasementLight(&light, presenceSensor, &doorSensor)` — 3 args, no
+  lux/threshold parameters, init options always `{}` — only when `config->presenceAddress > 0`, still inside the
+  same `controlBus` hold: it deletes `/light_state.bin` before constructing the library
+  `DataMgr` (so a pre-reboot persisted "on" never resurrects or parks the automation after
+  the all-relays-off boot doctrine), builds the composite `OccupancySource` at a 500 ms
+  interval and an `EDCommon::Automation::Light` with no lux gate (illuminance does not
+  influence this automation); `doorSensor` is passed even when the input expander is absent
+  (an uninited child never reports valid, so the composite degrades to presence-only), then
   `handler.setControls(&ventilationRelay, &light, &entranceLight, Faraday::Automation::changeover())`.
   After that block, a standalone `inputExpPresent`-gated (no I2C access, no `controlBus` guard,
   because `BinarySensor::init()` does no I/O) `doorSensor.init(DOOR_SENSOR_POLL_INTERVAL_MS,
@@ -269,7 +314,11 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   basement wall switch is NOT pumped here (its poll gate is inside `light.update()` below,
   which owns the sampling cadence), then a `controlBus`-guarded **relay pump block** run only
   when `relayExpPresent` (same 200 ms take) that calls `ventilationRelay.update()` +
-  `light.update()` + `entranceLight.update()` + `Faraday::Automation::update()`. The pump is
+  `light.update()` + `entranceLight.update()` + `Faraday::Automation::update()` +
+  `Faraday::Automation::updateBasementLight()` (pumps the composite source then the
+  `Automation::Light`; both calls are 500 ms-gated, the library's own update does a blocking
+  I2C light readback behind that gate while `controlBus` is held, and both no-op when the
+  automation was never inited). The pump is
   **no longer gated on `mqtt.isConnected()`**: the library publish paths self-skip while
   offline (relay heartbeat and `BinarySensor::publishState` guard on `isConnected()`, the
   relay/light state producers fail fast), so an offline broker produces no log storm, and the
@@ -278,8 +327,12 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   `Light::Relay::update()` pumps the backing relay and then `Light::update()` — never call
   `lightRelay.update()` directly — and `Light::update()` polls the wall-switch binding first
   and drains its command queue in the same call; `Automation::update()` pumps the changeover
-  facade and then both backing relays in the same pass. Then `modbus.loop()`,
-  the six null-guarded supplier `update()` calls plus the twelve null-guarded Anenji float
+  facade and then both backing relays in the same pass. Then `modbus.loop()`, then the
+  presence/lux pumps (`presenceSensor->update()` + `presenceLux->update()`, null-guarded),
+  deliberately **not** gated on `mqttUp`: the basement light automation must see fresh
+  presence while the broker is down, the binary sensor publish self-skips offline and the
+  lux sensor has no MQTT (read failures log `LOGE` only at their own 5 s / 10 s interval),
+  then the six null-guarded supplier `update()` calls plus the twelve null-guarded Anenji float
   sensor updates, `anenjiCharging.update()` and the four `anenji != nullptr`-guarded
   `AnenjiModeSensor::update()` calls (all 23 inside the `modbusBus` block; each object gates
   its own Modbus read internally — floats staggered 10 000–18 800 ms, charging 10 s, work
@@ -296,10 +349,11 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   is false only the deferred-reboot check runs. Modbus bus access is serialized between the
   loop task and the web handlers (AsyncTCP task) by a FreeRTOS binary semaphore
   `modbusBus` (created and initially given as one of the first `setup()` actions): `loop()`
-  wraps `modbus.loop()` + the six supplier and seventeen inverter `update()` calls in a
-  `xSemaphoreTake(modbusBus, 200 ms)` /
-  `xSemaphoreGive` pair (the sensor updates are additionally gated on `mqtt.isConnected()` so
-  an offline broker cannot produce a failed-publish log storm) and skips the whole
+  wraps `modbus.loop()` + the six supplier, seventeen inverter and two presence/lux `update()`
+  calls in a `xSemaphoreTake(modbusBus, 200 ms)` /
+  `xSemaphoreGive` pair (the supplier/inverter pumps are additionally gated on
+  `mqtt.isConnected()` so an offline broker cannot produce a failed-publish log storm; the
+  presence/lux pumps are the deliberate exception — see above) and skips the whole
   bus-touching block on contention (sensors retry
   at their next interval), and the meter/modbus/anenji handlers in `src/web/handler.cpp` take the
   same semaphore through the RAII `ModbusGuard` (also 200 ms bounded).
@@ -359,7 +413,7 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
     text-state `sensor`s (state topic + `{{ value }}` value template — no unit/device
     class/state class, `EDHA::Sensor` emits those only when set), the ventilation and
     generator **switches**, the light **lights** (basement `light` + `"Entrance light"`), and
-    the battery-charging/BMS/**Door** **binary_sensors**.
+    the battery-charging/BMS/**Door**/**Presence** **binary_sensors**.
   - `ed-healthcheck` — `Ready` interface + `HealthCheck`. Registered services, in order:
     `mqtt` always, then `MeterHealth`, `InverterHealth` (only when `anenji != nullptr` at
     boot) and `BmsHealth` (only when a BMS MAC is configured at boot). The device adapters
@@ -371,7 +425,11 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
     `getOutputVoltage`/`getOutputCurrent`/`getOutputActivePower`/`getBatteryVoltage`/
     `getBatteryCurrent`/`getBatteryPower`/`getPvVoltage`/`getPvCurrent`/`getPvPower`/
     `getBatteryCurrentFiltered` — registers 202/204/210/211/213/215/216/217/219/220/223/232,
-    no mains-current register).
+    no mains-current register), and `MTD262MB` (presence = input register `0x00`; Faraday
+    constructs the local `Faraday::MTD262MBIlluminance` over `*modbus.getClient()` instead of
+    calling `modbus.addMTD262MB()`, so the device is never added to the WirenBoard device
+    list; illuminance = input register `0x01`, s16 × scale 0.1 → lux, clamped ≥0; holding
+    registers are never written).
   - `ed-common` — `EDCommon::Sensor::Sensor` base (precision, update interval, MQTT publish,
     HA discovery incl. `state_class`) and header-only `WBMAP12E*` subclasses plus the local
     header-only `Faraday::` subclasses `WBMAP12EReactivePower` and `AnenjiSensor`. The energy
@@ -388,17 +446,27 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
     filter) and the `Light::withWallSwitch(sensor, WallSwitchType, pollMs)` option binds a
     sensor to a light: `Button` toggles on a debounced rising edge, `Switch` follows debounced
     changes, the binding is polled at the top of `Light::update()` and drained in the same
-    call, and the first valid read only seeds (no boot action). Relay/light/binary-sensor
+    call, and the first valid read only seeds (no boot action). Also used here:
+    `EDCommon::BinarySensor::MTD262MB` (presence over the ed-wb driver; `preInit()` sets
+    `device_class occupancy` and `reverse=false`) and `EDCommon::Automation::Light` (the
+    automation used by `src/automation/basement_light.cpp`: composite occupancy source,
+    optional lux gate (library capability — deliberately NOT used by Faraday), persisted
+    `LightState`, 500 ms internal gate, ~3 s manual adoption,
+    5/10 min manual parking). Relay/light/binary-sensor
     publishes self-skip while MQTT is disconnected.
   - `NimBLE-Arduino` — BLE stack used only by `src/bms/` (JBD client, characteristic
     notifications, scan); no BLE calls run outside the `"bms"` task.
   - `ESPAsyncWebServer` — port 80, no authentication.
-- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 5`) holds network, MQTT,
+- Config flow: `Config` (`src/config.h`, `CURRENT_VERSION = 6`) holds network, MQTT,
   HA-discovery flag/prefix, command/state/status topics, log settings, the
   Modbus/WB-MAP12E/Anenji fields (`modbusSpeed` default 9600, `map12eAddress` default 1,
   `map12eCt1Ratio` default 0, `anenjiAddress` default 0 = inverter disabled,
-  `energySyncValue`, `energyMeterBase`) and the BMS fields (`bmsMacAddress`, default `""` =
-  disabled, and `bmsCellCount`, default 12, valid 1..20). The MQTT portion is exposed at `GET /api/settings` and
+  `energySyncValue`, `energyMeterBase`), the BMS fields (`bmsMacAddress`, default `""` =
+  disabled, and `bmsCellCount`, default 12, valid 1..20) and, appended after `bmsCellCount`,
+  the presence fields (`presenceAddress` default 0 = sensor and basement automation disabled,
+  valid 0..247; `presenceLuxThreshold` default 100.0f, RESERVED, persisted-but-unused — kept
+  to avoid changing the v6 layout; the automation never reads it, `GET /api/settings/modbus`
+  still returns it, `POST` treats it as optional). The MQTT portion is exposed at `GET /api/settings` and
   written by `POST /api/settings/mqtt`, which mutates the in-RAM `Config` and calls
   `configMgr.store()`; the Modbus and meter sections have their own JSON endpoints. The whole
   struct is persisted raw to `/config.bin` by `EDConfig::DataMgr<Config>`/`StorageLittleFS`
@@ -409,13 +477,20 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   `load()` falls back to defaults and stores when the CRC/size is invalid. Changes are
   persisted immediately by their handlers; MQTT changes take effect after a reboot, network
   and log settings apply live, Modbus speed applies live (device register write on the old
-  baud, then local `Serial2.begin`), the MAP12E and Anenji addresses apply after a reboot,
-  and meter CT-ratio/sync writes hit the device before being stored. BMS MAC/cell count apply
+  baud, then local `Serial2.begin`), the MAP12E, Anenji and presence addresses apply after a
+  reboot (the reserved `presenceLuxThreshold` is stored but never consumed), and meter
+  CT-ratio/sync writes hit the device
+  before being stored. BMS MAC/cell count apply
   live to BLE polling after `POST /api/bms/settings`, but BMS MQTT/HA entities (including the
   number of cell entities) are created only at boot, so a reboot is required for discovery
-  changes. There is **no migration layer**: a layout change requires bumping
-  `CURRENT_VERSION`, so a pre-v5 `/config.bin` fails the CRC/size check and is silently
-  replaced by defaults, and pre-v5 backups are rejected on restore.
+  changes. The one boot migration is v5→v6 (`src/migration/`): a frozen `ConfigV5` replica is
+  read with an exact `sizeof(ConfigV5)+2` check and a CRC16 (init 0xFFFF, poly 0xA001, native
+  little-endian trailer) BEFORE `configMgr.load()` — `load()` alone would CRC-fail the grown
+  layout and clobber the file — then `applyLegacyConfigV5()` copies every v5 field
+  field-by-field (the two new fields get their defaults, `version` stays 6) and stores; every
+  failure path is `LOGW` + inert. Files ≤v4 (and their backups) remain rejected → defaults as
+  before, and the restore endpoints keep enforcing `version == 6` strictly (boot migration
+  only, prometey-style).
 - Backup specs currently contain only `config.bin`; append future domain state files to
   `BackupSpecs::kBackupFiles` (and bump the archive cap only with a reason — the library
   default is 16 KiB).
@@ -482,7 +557,15 @@ the Modbus, Meter, Anenji, BMS and Basement tabs (`frontend/src/pages/Modbus.tsx
   `faraday/<chip>/basement_temperature/state` (`°C`, `device_class temperature`, 1 decimal)
   and `faraday/<chip>/basement_humidity/state` (`%`, `device_class humidity`, integer), each
   with a 60 s heartbeat; nothing is published before the first valid read, and a failed read
-  holds the last value. When a BMS MAC is
+  holds the last value. When `presenceAddress > 0` at boot, `presenceSensor` registers one
+  HA **binary_sensor** "Presence" (`device_class occupancy` — a string passthrough, not an
+  ed-ha enum constant) on the same device and publishes retained `true`/`false` on
+  `faraday/<chip>/presence/state`, on change with a 60 s heartbeat, silently skipped while
+  MQTT is offline (the true state republishes on the first update after reconnect) and
+   nothing before the first valid read. The currently unconsumed lux cache and the basement
+   light automation own
+   **no MQTT topics and no HA entities**: `presenceLux` is inited with no options and
+  `initBasementLight()` passes no MQTT/discovery options either. When a BMS MAC is
   configured at boot, the BMS domain registers 14 numeric `measurement`-class sensors on
   `faraday/<chip>/bms_{state_of_charge,total_voltage,current,power,capacity_remaining,
   nominal_capacity,charging_cycles,min_cell_voltage,max_cell_voltage,avg_cell_voltage,
@@ -538,8 +621,8 @@ the config/backup routes take raw bodies.
 | `/api/wifi/list` | GET | `{networks:[{ssid,rssi,channel,encrypted}]}`; 500 `{"error":"scan failed"}` |
 | `/api/log/settings` | GET | `{host, uri, port, enabled}` |
 | `/api/log/settings` | POST | JSON (max 1024 B): `host`/`uri` required and <64 chars, `port` 1–65535, optional bool `enabled`; host/uri/port persist, `enabled` is runtime-only and follows connectivity; 200 returns the state |
-| `/api/settings/modbus` | GET | JSON `{modbusSpeed, map12eAddress, anenjiAddress}` (RS-485 speed, MAP12E unit id, ANENJI 4200 address; 0 = inverter disabled) |
-| `/api/settings/modbus` | POST | JSON (max 1024 B), all three fields required: `modbusSpeed` one of 9600/19200/38400/57600/115200, `map12eAddress` 1–247, `anenjiAddress` 0–247 (0 = disabled); speed applies live (device register write on the old baud, then `Serial2.begin`), both addresses take effect only after a reboot; a `modbusBus` guard timeout logs `modbus bus busy` and skips only the device write while `Serial2` still switches; 422 `{"message":"<field>: required\|invalid value"}` (incl. `anenjiAddress: required\|invalid value`), 500 store failure; 200 returns the refreshed state |
+| `/api/settings/modbus` | GET | JSON `{modbusSpeed, map12eAddress, anenjiAddress, presenceAddress, presenceLuxThreshold}` (RS-485 speed, MAP12E unit id, ANENJI 4200 address — 0 = inverter disabled, MTD262-MB address — 0 = presence sensor + basement light automation disabled, `presenceLuxThreshold` reserved/unused by the automation but still returned) |
+| `/api/settings/modbus` | POST | JSON (max 1024 B), **four required fields** — `modbusSpeed` one of 9600/19200/38400/57600/115200, `map12eAddress` 1–247, `anenjiAddress` 0–247 (0 = disabled), `presenceAddress` 0–247 (0 = disabled) — plus the **optional reserved** `presenceLuxThreshold` (absent key keeps the stored value; a present key must be numeric 0..4200); the panel sends only the four required fields. Speed applies live (device register write on the old baud, then `Serial2.begin`), the three addresses take effect only after a reboot; a `modbusBus` guard timeout logs `modbus bus busy` and skips only the device write while `Serial2` still switches; 422 `{"message":"<field>: required\|invalid value"}` (e.g. `presenceAddress: required\|invalid value`, `presenceLuxThreshold: invalid value` for a present-but-out-of-range key), 500 store failure; 200 returns the refreshed state |
 | `/api/settings/meter` | GET | JSON `{ct1Ratio, energySyncValue, energyMeterBase, meterEnergy, supplierEnergy}`; the two live readings are `null` while the meter is unreachable or the bus guard times out (still 200) |
 | `/api/settings/meter` | POST | JSON (max 1024 B), at least one of `ct1Ratio` (0–65535) / `energySyncValue` (≥0); device CT write and/or energy read happen **before** store, so 500 `{"message":"meter unreachable"}` aborts without persisting (a bus-guard timeout takes the same path); 422 field errors; 200 returns the refreshed state |
 | `/api/settings/anenji` | GET | Always 200 `{enabled, mainsVoltage, mainsCurrent, mainsPower, outputVoltage, outputCurrent, outputPower, batteryVoltage, batteryCurrent, batteryPower, batteryCharging, pvVoltage, pvCurrent, pvPower, workMode, outputMode, outputPriority, chargePriority}`; every reading is `null` when the inverter is disabled (`anenjiAddress == 0` or `setAnenji()` never wired), the 200 ms `modbusBus` guard times out, or the fast-fail probe fails (a failed first `getMainsVoltage` read skips the remaining 15 reads); on the reachable path each field is `null` iff its own read failed; `batteryCharging` is `bool\|null` from the register 232 sign (0/failed → `null`); the four mode fields are `string\|null` labels from `AnenjiModeSensor::label` (`"Unknown"` for unmapped enum values) with the same null semantics as the other readings; read-only — no POST on this route |
@@ -642,22 +725,72 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   Within the never-block-the-loop rule this is the accepted cost — the bus is serialized by
   the `modbusBus` semaphore rather than made asynchronous.
 - `POST /api/settings/modbus` writes the new speed to the bus (ed-wb broadcasts the speed
-  register to Modbus address 0) **before** switching the local `Serial2` baud; both addresses
-  take effect only after a reboot. The endpoint stores config first, so a failed device
+  register to Modbus address 0) **before** switching the local `Serial2` baud; the four
+  address/speed fields are required and the optional reserved `presenceLuxThreshold` is only
+  written when sent, and the three addresses take effect only after a
+  reboot. The endpoint stores config first, so a failed device
   write logs a warning but is not rolled back. If the bus guard times out (`modbus bus busy`
   warning) the device-side write is skipped but `Serial2` still switches to the persisted
   speed; nothing rewrites the meter's speed register at boot, so the device side stays at the
   old baud until the speed write is re-applied.
-- `CURRENT_VERSION` is 5 with **no migration layer**: a pre-v5 `/config.bin` fails the
-  CRC/size check and is silently replaced by defaults, and pre-v5 (v4) backups are rejected
-  on restore (member size check, with the version byte as a second guard).
-- v5 rejects v4 backups by design: an upgrade effectively resets the config — a pre-v5
-  `/config.bin` fails the CRC/size check and falls back to defaults, and restoring a v4
-  backup is refused; re-enter all settings (including the BMS MAC/cell count) after upgrading.
+- `CURRENT_VERSION` is 6 with the **first boot-migration layer** (v5→v6,
+  `src/migration/config_migration.*`): a legacy v5 `/config.bin` is read back BEFORE
+  `configMgr.load()` (exact `sizeof(ConfigV5)+2`, CRC16 init 0xFFFF / poly 0xA001, native
+  little-endian trailer, version ≤5; every failure path `LOGW` + inert) and re-applied
+  field-by-field, so an upgrade via `make deploy` migrates on first boot and **existing
+  settings survive without re-entry** — `load()` alone would CRC-fail the grown layout and
+  clobber the file. Files ≤v4 (and their backups) are still rejected → silently replaced by
+  defaults, exactly as before (member size + version byte guards).
+- Restore stays strict: the `/api/config` and `/api/config/backup` endpoints keep enforcing
+  `version == 6`, so a **pre-upgrade v5-era backup zip** (e.g. an old `build/deploy/latest.zip`)
+  is rejected on restore — by design, not data loss: the on-device config was already migrated
+  to v6 at first boot, and `make deploy`'s own backup (taken after that boot) is already v6
+  and restores fine. The migration is boot-only (prometey-style); no endpoint migrates.
 - `anenjiAddress` defaults to 0 (inverter disabled): enabling requires saving a non-zero
   address (1–247) on the Modbus tab **and a reboot**; while disabled no bus device, MQTT
   topics or HA entities exist, loop updates never touch the RS-485 device, and
   `GET /api/settings/anenji` answers `enabled:false` with every reading `null`.
+- `presenceAddress` defaults to 0: the MTD262-MB **and** the basement light automation are
+  dark until a non-zero address (0–247) is saved on the Modbus tab **and a reboot** — no
+  device, no "Presence" entity/topic, no lux cache, no automation, and the presence/lux
+  pumps never run. The address alone gates the feature; `presenceLuxThreshold` (default
+  100 lx) is reserved and takes no part in enabling anything.
+- Illuminance must NOT gate the basement automation (explicit owner decision); the library's
+  ~60 s lux-gate arming does not exist in this project and `presenceLuxThreshold` exists only
+  to keep the v6 config layout stable.
+- Manual adoption: a readback mismatch sustained ~3 s (6 × 500 ms passes; mismatches within
+  3 s of the automation's own command are ignored) is adopted as manual state and parks the
+  automation — 5 min if the light was left ON, or until 10 min after the last human-presence
+  detection if it was left OFF (library behavior in `EDCommon::Automation::Light`). While
+  parked, presence/door do not switch the light; only the library's own timers release it.
+- `/light_state.bin` (`BASEMENT_LIGHT_STATE_FILE`) is **deleted on every boot** before the
+  automation constructs its `DataMgr`: a persisted `enabled=true` would be adopted as a
+  manual override and park the automation, contradicting the all-relays-off boot doctrine.
+  The file holds only the library `LightState` snapshot (the unused `nightMode` plus the last
+  enabled/brightness/temperature/color) and is **intentionally absent** from
+  `BackupSpecs::kBackupFiles`.
+- The MTD262-MB is read-only from Faraday's side: only input registers `0x00` (presence) and
+  `0x01` (illuminance, s16 × 0.1 → lux, clamped ≥0) are read through the shared
+  `ModbusClient`; the device's holding registers (including its own light threshold `0x0B`)
+  are never written. The register map/scale follows the WB community Wiren Board template and
+  is **hardware-unverified** on this board.
+- The Presence entity's `device_class` is the raw string `"occupancy"` set by
+  `EDCommon::BinarySensor::MTD262MB::preInit()` — it is not one of the ed-ha
+  `deviceClassBinarySensor*` constants (string passthrough, HA accepts it).
+- With `presenceAddress` set but the device absent/misaddressed, each failed poll logs `LOGE`
+  at its own poll interval — presence every 5 s (12/min) plus lux every 10 s (6/min), i.e.
+  ~12+6 `LOGE` lines per minute, bounded, and nothing at all while the address is 0.
+- The presence/lux pumps are deliberately **not** gated on `mqtt.isConnected()` (unlike the
+  other RS-485 sensors) so the basement light automation keeps seeing fresh presence while
+  the broker is down: the binary sensor's publish self-skips offline, the lux cache has no
+  MQTT at all, and the automation itself owns no topics — everything runs with the broker
+  down; the true presence state republishes after reconnect.
+- Composite semantics: an open door alone keeps the light ON until the door
+  closes — `OccupancySource` is presence **OR** door, never reports invalid (it holds its
+  last verdict), and a presence child holding its last valid value rides through transient
+  Modbus failures; with the input expander absent the door child never reports valid, so the
+  composite degrades to presence-only. All of it is subject to the manual-override parking
+  above.
 - The Anenji mains current has **no register**: it is derived as mains power / mains voltage
   (PF = 1) and is invalid when the voltage read fails or the voltage is < 0.5 V — an
   estimate, not a measurement.
@@ -674,10 +807,12 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 - The Anenji mode/priority fields are **read-only**: Faraday never writes the inverter's
   setting registers (ed-wb's `setOutputMode`/`setOutputPriority`/`setBatteryChargePriority`
   are not wired) — change priorities on the inverter panel. This Anenji feature adds no
-  `Config` field of its own; the current `CURRENT_VERSION` is 5 because of the BMS fields.
+  `Config` field of its own; `CURRENT_VERSION` grew to 5 for the BMS fields and to 6 for the
+  presence fields.
 - After a config reset the Modbus defaults are already usable (meter address 1, inverter
   disabled at 0), so no address edit is required for the meter — but a previously enabled
-  inverter must be re-enabled (`anenjiAddress` set + reboot) after a `/config.bin` wipe.
+  inverter (`anenjiAddress` + reboot) and a previously enabled presence sensor/automation
+  (`presenceAddress` + reboot) must be re-enabled after a `/config.bin` wipe.
 - `ed-wb` and `ed-common` are git-pinned (`ed-wb#dfa808b1…`, `ed-common#0.8.0`); the WB-MAP12E
   support, the sensor family and the DHT11/DHT22 drivers ship in those releases;
   `lib_ignore = ESPAsyncTCP, RPAsyncTCP`
@@ -755,7 +890,7 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   basement light is HA/panel-only. Both probes still log a warning.
 - Relays are **ALL OFF after every boot/reboot**: `relayExp.begin()` writes `0xFF` to the
   bank before any other write, and relay state is intentionally not persisted (no relay
-  `Config` fields — `CURRENT_VERSION` is 5 because of the BMS fields, and 4 was only because
+  `Config` fields — `CURRENT_VERSION` is 6 because of the presence fields, and 4 was only because
   of `anenjiAddress`) — there is no startup-state persistence by design.
 - The reverse-order mapping K3 → channel 5 (ventilation) / K4 → channel 4 (light) is
   **hardware-verified** (forward mapping 2/3 was observed firing relays K6/K5; the PCF8574
@@ -827,7 +962,8 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
 - **Pinned ed-utils NetworkLogger appends every esp_log line into a 16 KB
   `std::string` even when disabled**; during offline storms the capacity-crossing realloc
   aborts (`bad_alloc`→`std::terminate`) on small heaps. The app therefore gates sensor pumps
-  on `mqtt.isConnected()` (loop + `Bms::update`), keeps `CORE_DEBUG_LEVEL=3`, and sets the
+  on `mqtt.isConnected()` (loop + `Bms::update`; the presence/lux pumps are the deliberate
+  exception — their offline paths log nothing), keeps `CORE_DEBUG_LEVEL=3`, and sets the
   runtime esp_log level to INFO (`esp_log_level_set("*", ESP_LOG_INFO)` in `setup()`) because
   ed-utils `LOGD`/`LOGV` bypass the compile-time gate via `esp_log_write` — a boot abort was
   reproduced at ~24 s uptime when a full MQTT publish-payload dump (ed-mqtt `mqtt.cpp:108`)
@@ -867,9 +1003,10 @@ reaches the client; do not call `ESP.restart()` directly from a handler.
   current/capacity scale (0.1 vs 0.01 depending on MOSFET-bit7) are ported from
   esphome-jbd-bms and **hardware-unverified**.
 - BMS support grew the firmware by roughly 297 KB with NimBLE-Arduino; the app slot still has
-  ~405 KB of headroom at 1,495,120 B used (78.7%). OTA and USB flashing are unaffected.
-- A v5 upgrade resets `/config.bin` (pre-v5 fails CRC/size) and rejects v4 backups — re-enter
-  the BMS MAC/cell count after upgrading.
+  ~389 KB of headroom (current size in the partition-layout note above). OTA and USB flashing are unaffected.
+- The v5→v6 upgrade is the only migration: settings carry over automatically on first boot,
+  while files ≤v4 are reset and v5-era backup zips are refused on restore (see the migration
+  gotchas above).
 - Library APIs change: read the checked-out sources under `.pio/libdeps/faraday/<lib>/src`
   instead of guessing. `data/` is generated; do not edit it by hand.
 

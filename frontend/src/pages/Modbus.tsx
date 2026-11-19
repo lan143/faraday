@@ -9,27 +9,31 @@ import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 
 /**
- * Modbus tab: RS-485 speed, WB-MAP12E unit address and Anenji inverter
- * address. Prefilled from `GET /api/settings/modbus`, validated against the
- * firmware whitelist, and saved with `POST /api/settings/modbus` (JSON). The
- * speed is applied live; both addresses take effect after a reboot.
+ * Modbus tab: RS-485 speed, WB-MAP12E unit address, Anenji inverter address and
+ * the MTD262-MB presence sensor address. Prefilled from
+ * `GET /api/settings/modbus`, validated against the firmware whitelist, and
+ * saved with `POST /api/settings/modbus` (JSON). The speed is applied live; the
+ * addresses take effect after a reboot.
  */
 
 interface ModbusForm {
   modbusSpeed: string;
   map12eAddress: string;
   anenjiAddress: string;
+  presenceAddress: string;
 }
 
 interface ModbusErrors {
   map12eAddress?: string;
   anenjiAddress?: string;
+  presenceAddress?: string;
 }
 
 const EMPTY_MODBUS: ModbusForm = {
   modbusSpeed: String(LIMITS.modbus.speeds[0]),
   map12eAddress: '',
   anenjiAddress: '',
+  presenceAddress: '0',
 };
 
 function validateModbus(form: ModbusForm): ModbusErrors {
@@ -61,6 +65,19 @@ function validateModbus(form: ModbusForm): ModbusErrors {
     }
   }
 
+  if (form.presenceAddress.trim() === '') {
+    errors.presenceAddress = 'Presence sensor address is required.';
+  } else {
+    const address = Number(form.presenceAddress);
+    if (
+      !Number.isInteger(address) ||
+      address < LIMITS.modbus.presenceAddressMin ||
+      address > LIMITS.modbus.presenceAddressMax
+    ) {
+      errors.presenceAddress = `Presence sensor address must be an integer between ${LIMITS.modbus.presenceAddressMin} and ${LIMITS.modbus.presenceAddressMax}.`;
+    }
+  }
+
   return errors;
 }
 
@@ -75,6 +92,8 @@ interface TextFieldProps {
   type?: 'text' | 'number';
   min?: number;
   max?: number;
+  step?: number;
+  inputMode?: 'numeric' | 'decimal';
   error?: string;
   help?: string;
 }
@@ -86,6 +105,8 @@ function TextField({
   type = 'text',
   min,
   max,
+  step,
+  inputMode,
   error,
   help,
 }: TextFieldProps) {
@@ -97,6 +118,8 @@ function TextField({
         value={value}
         min={min}
         max={max}
+        step={step}
+        inputMode={inputMode}
         aria-invalid={error ? true : undefined}
         onInput={(event) => onInput(event.currentTarget.value)}
       />
@@ -144,6 +167,9 @@ export function ModbusPage() {
   const [loadedAnenjiAddress, setLoadedAnenjiAddress] = useState<number | null>(
     null,
   );
+  const [loadedPresenceAddress, setLoadedPresenceAddress] = useState<
+    number | null
+  >(null);
 
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -157,9 +183,11 @@ export function ModbusPage() {
         modbusSpeed: String(result.data.modbusSpeed),
         map12eAddress: String(result.data.map12eAddress),
         anenjiAddress: String(result.data.anenjiAddress),
+        presenceAddress: String(result.data.presenceAddress),
       });
       setLoadedAddress(result.data.map12eAddress);
       setLoadedAnenjiAddress(result.data.anenjiAddress);
+      setLoadedPresenceAddress(result.data.presenceAddress);
     } else {
       setLoadError(result.message);
     }
@@ -186,27 +214,32 @@ export function ModbusPage() {
 
       const address = Number(form.map12eAddress);
       const anenjiAddress = Number(form.anenjiAddress);
+      const presenceAddress = Number(form.presenceAddress);
       setSaving(true);
       try {
         const result = await saveModbusSettings({
           modbusSpeed: Number(form.modbusSpeed),
           map12eAddress: address,
           anenjiAddress,
+          presenceAddress,
         });
         if (result.ok) {
           setForm({
             modbusSpeed: String(result.data.modbusSpeed),
             map12eAddress: String(result.data.map12eAddress),
             anenjiAddress: String(result.data.anenjiAddress),
+            presenceAddress: String(result.data.presenceAddress),
           });
           const addressChanged =
             address !== loadedAddress ||
-            anenjiAddress !== loadedAnenjiAddress;
+            anenjiAddress !== loadedAnenjiAddress ||
+            presenceAddress !== loadedPresenceAddress;
           setLoadedAddress(result.data.map12eAddress);
           setLoadedAnenjiAddress(result.data.anenjiAddress);
+          setLoadedPresenceAddress(result.data.presenceAddress);
           setNotice(
             addressChanged
-              ? 'Modbus settings saved. The new speed is applied now; the address takes effect only after a reboot.'
+              ? 'Modbus settings saved. The new speed is applied now; the addresses take effect only after a reboot (presence address 0 disables the sensor and automation).'
               : 'Modbus settings saved. The new speed is applied now.',
           );
         } else {
@@ -217,7 +250,7 @@ export function ModbusPage() {
       }
       setSaving(false);
     },
-    [form, loadedAddress, loadedAnenjiAddress],
+    [form, loadedAddress, loadedAnenjiAddress, loadedPresenceAddress],
   );
 
   if (!loaded) {
@@ -266,6 +299,18 @@ export function ModbusPage() {
             max={LIMITS.modbus.anenjiAddressMax}
             error={errors.anenjiAddress}
             help={`0 disables the inverter; applies after reboot. Valid ${LIMITS.modbus.anenjiAddressMin}-${LIMITS.modbus.anenjiAddressMax}.`}
+          />
+          <TextField
+            label="Presence sensor address (MTD262-MB)"
+            value={form.presenceAddress}
+            onInput={(value) => updateForm({ presenceAddress: value })}
+            type="number"
+            min={LIMITS.modbus.presenceAddressMin}
+            max={LIMITS.modbus.presenceAddressMax}
+            step={1}
+            inputMode="numeric"
+            error={errors.presenceAddress}
+            help="0 \u2014 presence sensor and basement light automation disabled. Takes effect after reboot."
           />
           {notice ? (
             <Banner

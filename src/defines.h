@@ -49,6 +49,18 @@
 #define BASEMENT_SWITCH_POLL_INTERVAL_MS 30
 #define BASEMENT_SWITCH_DEBOUNCE_MS 50
 
+// Saifuli MTD262-MB presence/illuminance sensor on the RS-485 bus (address in
+// Config::presenceAddress, 0 = disabled). The presence binary sensor polls the
+// device every 5 s; the internal-only lux sensor polls every 10 s into a cache
+// reserved for future use (it does NOT feed the basement light automation). The
+// composite (presence OR door) source is pumped at 500 ms to match the
+// ed-common Light automation's internal gate. The automation persists its own
+// LightState here.
+#define PRESENCE_SENSOR_POLL_INTERVAL_MS 5000
+#define PRESENCE_LUX_POLL_INTERVAL_MS 10000
+#define BASEMENT_LIGHT_SOURCE_POLL_MS 500
+#define BASEMENT_LIGHT_STATE_FILE "/light_state.bin"
+
 // Shared sensor/LED connector (one device at a time: DS18B20 / DHT11 / DHT21 / LED strip #2).
 // The basement DHT11 climate sensor is the device currently occupying it.
 #define SENSOR_BUS_PIN 14

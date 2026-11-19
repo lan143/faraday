@@ -72,6 +72,9 @@ export const LIMITS = {
     /** Anenji inverter address; `0` disables it, otherwise 1..247. */
     anenjiAddressMin: 0,
     anenjiAddressMax: 247,
+    /** MTD262-MB presence sensor address; `0` disables sensor + automation. */
+    presenceAddressMin: 0,
+    presenceAddressMax: 247,
   },
   meter: {
     /** `uint16_t` register value; 0 disables the CT ratio. */
@@ -316,7 +319,7 @@ export function postMqtt(payload: MqttPayload): Promise<ActionResult> {
   return sendForm('/api/settings/mqtt', body);
 }
 
-/** GET /api/settings/modbus — RS-485 speed, MAP12E and Anenji addresses. */
+/** GET /api/settings/modbus — RS-485 speed, MAP12E/Anenji/presence addresses. */
 export function getModbusSettings(): Promise<ApiResult<ModbusSettings>> {
   return getJson<ModbusSettings>(
     '/api/settings/modbus',
@@ -325,8 +328,8 @@ export function getModbusSettings(): Promise<ApiResult<ModbusSettings>> {
 }
 
 /**
- * POST /api/settings/modbus — persists all three fields and returns the
- * refreshed state. The speed applies live; both addresses take effect after a
+ * POST /api/settings/modbus — persists the four fields and returns the
+ * refreshed state. The speed applies live; the addresses take effect after a
  * reboot. Invalid input throws client-side instead of being sent.
  */
 export function saveModbusSettings(
@@ -355,12 +358,22 @@ export function saveModbusSettings(
       `Anenji address must be an integer between ${LIMITS.modbus.anenjiAddressMin} and ${LIMITS.modbus.anenjiAddressMax}.`,
     );
   }
+  if (
+    !Number.isInteger(payload.presenceAddress) ||
+    payload.presenceAddress < LIMITS.modbus.presenceAddressMin ||
+    payload.presenceAddress > LIMITS.modbus.presenceAddressMax
+  ) {
+    throw new Error(
+      `Presence sensor address must be an integer between ${LIMITS.modbus.presenceAddressMin} and ${LIMITS.modbus.presenceAddressMax}.`,
+    );
+  }
   return postJson<ModbusSettings>(
     '/api/settings/modbus',
     {
       modbusSpeed: payload.modbusSpeed,
       map12eAddress: payload.map12eAddress,
       anenjiAddress: payload.anenjiAddress,
+      presenceAddress: payload.presenceAddress,
     },
     EMPTY_BODY_MESSAGE,
   );

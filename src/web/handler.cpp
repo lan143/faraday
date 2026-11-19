@@ -11,6 +11,7 @@
 #include <sensor/sensor.h>
 #include <wirenboard.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string.h>
 #include "bms/bms.h"
@@ -442,6 +443,8 @@ void Handler::sendModbusSettingsState(AsyncWebServerRequest* request, int status
         entity["modbusSpeed"] = config->modbusSpeed;
         entity["map12eAddress"] = config->map12eAddress;
         entity["anenjiAddress"] = config->anenjiAddress;
+        entity["presenceAddress"] = config->presenceAddress;
+        entity["presenceLuxThreshold"] = config->presenceLuxThreshold;
     });
 
     response->write(payload.c_str());
@@ -520,6 +523,49 @@ void Handler::registerModbusSettingsHandlers()
                 return;
             }
 
+            const JsonVariant presenceAddressValue = json["presenceAddress"];
+            if (presenceAddressValue.isNull()) {
+                sendFieldError(request, "presenceAddress", "required");
+                return;
+            }
+
+            // is<unsigned int>() only accepts JSON integers, never floats.
+            if (!presenceAddressValue.is<unsigned int>()) {
+                sendFieldError(request, "presenceAddress", "invalid value");
+                return;
+            }
+
+            const uint32_t presenceAddress = presenceAddressValue.as<uint32_t>();
+            if (presenceAddress > 247) {
+                sendFieldError(request, "presenceAddress", "invalid value");
+                return;
+            }
+
+            // presenceLuxThreshold is optional (reserved): the field is
+            // persisted for a future illuminance feature but is currently not
+            // used by the basement light automation, so the panel no longer
+            // sends it. An absent key leaves the stored value unchanged; a
+            // present key is validated exactly as before (forward-compatible).
+            const JsonVariant presenceLuxThresholdValue = json["presenceLuxThreshold"];
+            const bool hasPresenceLuxThreshold = !presenceLuxThresholdValue.isNull();
+            float presenceLuxThreshold = 0.0f;
+            if (hasPresenceLuxThreshold) {
+                // Accept either numeric JSON form: an integer (100) and a float
+                // (50.5) are both valid. as<float>() converts both.
+                if (!(presenceLuxThresholdValue.is<float>() || presenceLuxThresholdValue.is<int>())) {
+                    sendFieldError(request, "presenceLuxThreshold", "invalid value");
+                    return;
+                }
+
+                presenceLuxThreshold = presenceLuxThresholdValue.as<float>();
+                if (!std::isfinite(presenceLuxThreshold)
+                    || presenceLuxThreshold < 0.0f
+                    || presenceLuxThreshold > 4200.0f) {
+                    sendFieldError(request, "presenceLuxThreshold", "invalid value");
+                    return;
+                }
+            }
+
             Config* config = _configMgr->getData();
             const uint32_t oldSpeed = config->modbusSpeed;
 
@@ -528,6 +574,14 @@ void Handler::registerModbusSettingsHandlers()
             // 0 disables the inverter; any other value is its Modbus slave
             // address. Like map12eAddress, it applies after a reboot.
             config->anenjiAddress = static_cast<uint8_t>(anenjiAddress);
+            // 0 disables the MTD262-MB presence sensor (and the basement light
+            // automation). presenceAddress, like the addresses above, only takes
+            // effect after a reboot. The reserved lux threshold is only written
+            // when the client sent it, so an omitted key keeps the stored value.
+            config->presenceAddress = static_cast<uint8_t>(presenceAddress);
+            if (hasPresenceLuxThreshold) {
+                config->presenceLuxThreshold = presenceLuxThreshold;
+            }
 
             if (!_configMgr->store()) {
                 request->send(500, "application/json", "{\"message\": \"failed to store config\"}");

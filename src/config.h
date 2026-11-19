@@ -9,7 +9,7 @@
 #include "defines.h"
 
 // Bump whenever the persisted layout changes (fields reordered/renamed/retyped).
-#define CURRENT_VERSION 5
+#define CURRENT_VERSION 6
 
 #define MQTT_TOPIC_LEN 64
 
@@ -49,4 +49,13 @@ struct Config
     // Real number of cells in the battery pack (this board: 12S battery on a
     // 20S-capable BMS), valid range 1..20. Cell telemetry is capped to this.
     uint8_t bmsCellCount = 12;
+
+    // Saifuli MTD262-MB presence/lux sensor Modbus address; 0 = sensor disabled
+    // and the basement light automation disabled (mirrors the anenjiAddress = 0
+    // convention). presenceLuxThreshold is reserved: persisted for a future
+    // illuminance feature but NOT used by the automation currently. Both are
+    // appended after the v5 fields (CURRENT_VERSION 6);
+    // migration/config_migration.h carries the frozen v5 replica.
+    uint8_t presenceAddress = 0;
+    float presenceLuxThreshold = 100.0f;
 };

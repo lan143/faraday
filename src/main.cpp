@@ -22,12 +22,14 @@
 #include <sensor/anenji_sensor.h>
 #include <sensor/anenji_charging_state.h>
 #include <sensor/anenji_mode_sensor.h>
+#include <sensor/mtd262mb_illuminance.h>
 #include <sensor/dht11_sensor.h>
 #include <sensor/dht11_temperature.h>
 #include <sensor/dht11_humidity.h>
 #include <relay/pcf8574.h>
 #include <light/relay_light.h>
 #include <binary_sensor/pcf8574.h>
+#include <binary_sensor/mtd262mb.h>
 #include <enum/device_class.h>
 #include <health/device_health.h>
 #include <health/status_led.h>
@@ -37,7 +39,9 @@
 #include "defines.h"
 #include "config.h"
 #include "automation/automation.h"
+#include "automation/basement_light.h"
 #include "bms/bms.h"
+#include "migration/config_migration.h"
 #include "web/handler.h"
 #include "web/reboot_after_response.h"
 
@@ -86,6 +90,15 @@ EDCommon::Sensor::Sensor* supplierEnergyCurrent = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyPower = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyReactivePower = nullptr;
 EDCommon::Sensor::Sensor* supplierEnergyFrequency = nullptr;
+
+// Saifuli MTD262-MB presence/illuminance sensor (Config::presenceAddress, 0 =
+// disabled). The binary sensor owns the "Presence" HA entity/MQTT topic; the lux
+// sensor is an internal cache reserved for future use (no topics, no entities,
+// and not consumed by the basement light automation). Both are allocated once
+// in setup().
+Faraday::MTD262MBIlluminance* presenceDevice = nullptr;
+EDCommon::BinarySensor::MTD262MB* presenceSensor = nullptr;
+Faraday::MTD262IlluminanceSensor* presenceLux = nullptr;
 
 // Basement climate: a DHT11 on the shared GPIO14 connector. The two sensor
 // objects share one driver instance, so one physics read feeds both per cycle.
@@ -221,7 +234,19 @@ void setup()
     });
 
     LOGI("setup", "load config");
+    // A v5 /config.bin is read back as a frozen legacy struct BEFORE load():
+    // ed-config's load() only checks the CRC, so a size/CRC mismatch (which an
+    // appended v6 field always causes) falls back to defaults and overwrites
+    // the file. Reading it here lets us migrate instead of resetting. Absent,
+    // corrupt or already-v6 files fail the exact-size check and are inert.
+    auto* legacyConfigV5 = new ConfigV5();
+    const bool hasLegacyConfigV5 = readLegacyConfigV5(legacyConfigV5);
     configMgr.load();
+    if (hasLegacyConfigV5) {
+        applyLegacyConfigV5(configMgr.getData(), *legacyConfigV5);
+        configMgr.store();
+    }
+    delete legacyConfigV5;
 
     networkLogger.init(configMgr.getData()->log, CONTROLLER_NAME, EDUtils::formatString("Faraday_%s", EDUtils::getMacAddress().c_str()));
 
@@ -467,6 +492,31 @@ void setup()
     }
     handler.setBasementSensors(basementTemperature, basementHumidity);
 
+    // Saifuli MTD262-MB presence/illuminance sensor. We intentionally do NOT use
+    // modbus.addMTD262MB(): the illuminance subclass shares the single
+    // ModbusClient already initialised by modbus.init(15) and the WirenBoard
+    // device list would only call empty per-device loops.
+    if (config->presenceAddress > 0) {
+        presenceDevice = new Faraday::MTD262MBIlluminance(*modbus.getClient());
+        presenceDevice->init(config->presenceAddress);
+        presenceSensor = new EDCommon::BinarySensor::MTD262MB(presenceDevice);
+        presenceLux = new Faraday::MTD262IlluminanceSensor(presenceDevice);
+        if (!presenceSensor->init(PRESENCE_SENSOR_POLL_INTERVAL_MS, {
+                EDCommon::BinarySensor::withMQTT(&mqtt, mqttPrefix, "faraday", "Presence"),
+                EDCommon::BinarySensor::withDiscovery(&discoveryMgr, device),
+            })) {
+            LOGE("setup", "failed to init presence sensor");
+        }
+        // Internal-only lux cache: no options (no MQTT topic, no HA entity).
+        // Precision 1 = 0.1 lux resolution.
+        if (!presenceLux->init(1, PRESENCE_LUX_POLL_INTERVAL_MS, {})) {
+            LOGE("setup", "failed to init presence lux sensor");
+        }
+        LOGI("setup", "presence sensor enabled at address %u", (unsigned)config->presenceAddress);
+    } else {
+        LOGI("setup", "presence sensor disabled (address 0)");
+    }
+
     Faraday::Bms::init(&mqtt, &discoveryMgr, device, mqttPrefix);
     handler.setBms(Faraday::Bms::client());
 
@@ -530,6 +580,19 @@ void setup()
         }
 
         Faraday::Automation::init(&mqtt, &discoveryMgr, device, mqttPrefix);
+
+        // Basement light automation: ON while (presence OR door open), no
+        // illuminance gate (the lux sensor is read into an internal cache but is
+        // not consumed here). doorSensor is passed even when the input expander
+        // is absent — an uninited sensor reports invalid, so the composite source
+        // degrades to presence-only.
+        if (config->presenceAddress > 0) {
+            Faraday::Automation::initBasementLight(
+                &light,
+                presenceSensor,
+                &doorSensor
+            );
+        }
 
         if (controlBusLocked) {
             xSemaphoreGive(controlBus);
@@ -599,6 +662,7 @@ void loop()
         light.update();
         entranceLight.update();
         Faraday::Automation::update();
+        Faraday::Automation::updateBasementLight();
         xSemaphoreGive(controlBus);
     }
 
@@ -609,6 +673,11 @@ void loop()
     const bool mqttUp = mqtt.isConnected();
     if (modbusBus != nullptr && xSemaphoreTake(modbusBus, pdMS_TO_TICKS(200)) == pdTRUE) {
         modbus.loop();
+        // Presence/lux are deliberately NOT gated on mqttUp: the basement light
+        // automation must see fresh presence while the broker is down. The
+        // binary sensor publish self-skips offline and the lux sensor has no MQTT.
+        if (presenceSensor) presenceSensor->update();
+        if (presenceLux) presenceLux->update();
         // While MQTT is down the reads have no destination; pumping them only
         // produces failed-publish log storms (the pinned ed-utils logger's
         // growing append reallocs and aborts on small heaps). Skip until the

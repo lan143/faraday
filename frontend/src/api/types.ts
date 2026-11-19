@@ -49,20 +49,29 @@ export interface MqttPayload {
 }
 
 /**
- * GET /api/settings/modbus — persisted RS-485 speed, MAP12E address and
- * Anenji inverter address (`0` disables the inverter).
+ * GET /api/settings/modbus — persisted RS-485 speed, MAP12E address,
+ * Anenji inverter address (`0` disables the inverter) and MTD262-MB presence
+ * sensor settings. `presenceAddress` 0 disables the presence sensor and the
+ * basement-light automation.
  */
 export interface ModbusSettings {
   modbusSpeed: number;
   map12eAddress: number;
   anenjiAddress: number;
+  presenceAddress: number;
+  /**
+   * Reserved: persisted but not used by the automation; not sent by the panel
+   * anymore.
+   */
+  presenceLuxThreshold: number;
 }
 
-/** POST /api/settings/modbus body (JSON). All three fields are required. */
+/** POST /api/settings/modbus body (JSON). All four fields are required. */
 export interface ModbusPayload {
   modbusSpeed: number;
   map12eAddress: number;
   anenjiAddress: number;
+  presenceAddress: number;
 }
 
 /**
