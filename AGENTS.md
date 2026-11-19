@@ -106,6 +106,16 @@ Standalone targets: `make firmware` / `firmware-ota`, `make ui` / `ui-ota`,
 back up or restore by itself; only `deploy` does. `HOST`, `PIO`, `WAIT_INITIAL`,
 `WAIT_TIMEOUT`, `POLL_INTERVAL`, `BACKUP_DIR`, `BACKUP_ZIP` and `ZIP` are overridable.
 
+### Flash/deploy discipline
+
+Never run `make deploy`, the `*-ota` upload targets or `pio run ... -t upload/uploadfs/uploadfsota`
+without the user's explicit go-ahead in the current conversation: they reboot the live controller,
+and by design every reboot turns ALL relays off (including the basement light). Flashing during an
+active, user-driven debugging session is allowed. Once the feature works and the current code is on
+the device, debugging is considered finished: do not re-flash for any reason (to finalize a build,
+stamp the fwVersion, or validate the deploy pipeline) without fresh explicit permission. Warn before
+any authorized reboot that relays will drop.
+
 Partition layout (`partitions.csv`): two app slots `0x1D0000` = 1,900,544 B (~1.81 MiB) each
 at `0x10000` / `0x1E0000`, and the LittleFS `spiffs` data slot at `0x3B0000` with size
 `0x50000` = 327,680 B (320 KiB). The current firmware is 1,495,120 B
